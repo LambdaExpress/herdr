@@ -522,14 +522,37 @@ pub fn read_clipboard_text() -> Option<String> {
     }
 }
 
-pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
+pub fn file_manager_available() -> bool {
+    macos_gui_session_available_with_command(|program| Command::new(program))
+}
+
+fn macos_gui_session_available_with_command(mut command: impl FnMut(&str) -> Command) -> bool {
+    let domain = format!("gui/{}", unsafe { libc::geteuid() });
+    command("/bin/launchctl")
+        .args(["print", &domain])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn spawn_macos_open(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
     Command::new("open")
-        .arg(url)
+        .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(Some)
+}
+
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
+    spawn_macos_open(OsStr::new(url))
+}
+
+pub fn open_in_file_manager(path: &Path) -> std::io::Result<Option<std::process::Child>> {
+    spawn_macos_open(path.as_os_str())
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -997,6 +1020,16 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_manager_requires_a_macos_gui_launch_domain() {
+        assert!(macos_gui_session_available_with_command(|_| Command::new(
+            "/usr/bin/true"
+        )));
+        assert!(!macos_gui_session_available_with_command(|_| Command::new(
+            "/usr/bin/false"
+        )));
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {

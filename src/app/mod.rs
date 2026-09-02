@@ -6147,10 +6147,13 @@ last_pane = "prefix+tab"
         app.state.selected = 0;
         app.state.confirm_close = false;
         app.state.context_menu = Some(state::ContextMenuState {
-            kind: state::ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: state::ContextMenuKind::Workspace {
+                ws_idx: 1,
+                file_manager_available: false,
+            },
             x: 2,
             y: 2,
-            list: state::MenuListState::new(1),
+            list: state::MenuListState::new(2),
         });
         app.state.mode = Mode::ContextMenu;
 

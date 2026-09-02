@@ -34,6 +34,8 @@ pub(crate) struct ClientConnection {
     pub(crate) mode: ClientConnectionMode,
     /// True after the handshake for clients that will switch into direct terminal attach mode.
     pub(crate) pending_terminal_attach: bool,
+    /// Whether this client reaches the server through Herdr's remote transport.
+    pub(crate) remote: bool,
     /// Client-local app keybindings. None means use the server's keybindings.
     pub(crate) keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
     /// The client's terminal size after clamping.
@@ -120,6 +122,7 @@ impl ClientConnection {
         Self {
             mode,
             pending_terminal_attach,
+            remote: false,
             keybindings,
             terminal_size,
             cell_size,

@@ -477,6 +477,9 @@ pub enum ClientMessage {
 
     /// The direct command was written and flushed; terminal response timing starts now.
     GraphicsTransmissionStarted { transfer_id: u64, image_id: u32 },
+
+    /// Whether this app client is connected through Herdr's remote transport.
+    ClientEnvironment { remote: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -781,6 +784,9 @@ pub enum ServerMessage {
 
     /// Suppress a direct command that expired before terminal delivery.
     GraphicsTransmissionRetired { transfer_id: u64, image_id: u32 },
+
+    /// Open a server-provided local path in the foreground client's file manager.
+    OpenInFileManager { path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1093,17 @@ mod tests {
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_environment_roundtrip() {
+        for remote in [false, true] {
+            let msg = ClientMessage::ClientEnvironment { remote };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 
     #[test]
@@ -1545,6 +1562,17 @@ mod tests {
     fn server_clipboard_roundtrip() {
         let msg = ServerMessage::Clipboard {
             data: "dGVzdA==".to_owned(), // base64 "test"
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_file_manager_open_roundtrip() {
+        let msg = ServerMessage::OpenInFileManager {
+            path: r"D:\project\herdr".to_owned(),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =

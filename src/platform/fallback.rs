@@ -202,6 +202,21 @@ pub fn read_clipboard_text() -> Option<String> {
 }
 
 /// Unsupported platform stub.
+pub fn file_manager_available() -> bool {
+    false
+}
+
+/// Unsupported platform stub.
+pub fn open_in_file_manager(
+    _path: &std::path::Path,
+) -> std::io::Result<Option<std::process::Child>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening a file manager is not supported on this platform",
+    ))
+}
+
+/// Unsupported platform stub.
 pub fn open_url(_url: &str) -> std::io::Result<Option<std::process::Child>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

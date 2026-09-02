@@ -39,6 +39,15 @@ pub(crate) fn apply_pane_runtime_marker(command: &mut portable_pty::CommandBuild
     apply_pane_runtime_marker_platform(command);
 }
 
+pub(crate) fn path_for_user_display(path: &std::path::Path) -> String {
+    path_for_user_display_platform(path)
+}
+
+#[cfg(not(windows))]
+fn path_for_user_display_platform(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 #[cfg(not(windows))]
 pub(crate) fn terminal_title_for_presentation(title: &str) -> &str {
     title

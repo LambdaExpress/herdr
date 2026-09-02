@@ -30,6 +30,12 @@ enum Phase {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionKind {
+    Linear,
+    Block,
+}
+
 /// A text selection within a terminal pane.
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -41,6 +47,8 @@ pub struct Selection {
     cursor: (u32, u16),
     /// Selection phase.
     phase: Phase,
+    /// Whether rows follow terminal reading order or share fixed column bounds.
+    kind: SelectionKind,
 }
 
 impl Selection {
@@ -52,12 +60,33 @@ impl Selection {
         col: u16,
         metrics: Option<ScrollMetrics>,
     ) -> Self {
+        Self::anchor_with_kind(pane_id, viewport_row, col, metrics, SelectionKind::Linear)
+    }
+
+    /// Start a potential rectangular block selection.
+    pub(crate) fn block_anchor(
+        pane_id: PaneId,
+        viewport_row: u16,
+        col: u16,
+        metrics: Option<ScrollMetrics>,
+    ) -> Self {
+        Self::anchor_with_kind(pane_id, viewport_row, col, metrics, SelectionKind::Block)
+    }
+
+    fn anchor_with_kind(
+        pane_id: PaneId,
+        viewport_row: u16,
+        col: u16,
+        metrics: Option<ScrollMetrics>,
+        kind: SelectionKind,
+    ) -> Self {
         let anchor = (absolute_row_for_viewport_row(viewport_row, metrics), col);
         Self {
             pane_id,
             anchor,
             cursor: anchor,
             phase: Phase::Anchored,
+            kind,
         }
     }
 
@@ -75,6 +104,7 @@ impl Selection {
             anchor: (row, start_col),
             cursor: (row, end_col),
             phase: Phase::Dragging,
+            kind: SelectionKind::Linear,
         }
     }
 
@@ -94,6 +124,7 @@ impl Selection {
             anchor: (anchor_row, anchor_col),
             cursor: (cursor_row, cursor_col),
             phase: Phase::Dragging,
+            kind: SelectionKind::Linear,
         }
     }
 
@@ -193,14 +224,18 @@ impl Selection {
         self.phase == Phase::Dragging
     }
 
+    pub(crate) fn is_block(&self) -> bool {
+        self.kind == SelectionKind::Block
+    }
+
     /// Returns (start, end) in reading order (top-left to bottom-right).
     fn ordered(&self) -> ((u32, u16), (u32, u16)) {
         let (ar, ac) = self.anchor;
         let (cr, cc) = self.cursor;
-        if ar < cr || (ar == cr && ac <= cc) {
-            ((ar, ac), (cr, cc))
-        } else {
-            ((cr, cc), (ar, ac))
+        match self.kind {
+            SelectionKind::Linear if ar < cr || (ar == cr && ac <= cc) => ((ar, ac), (cr, cc)),
+            SelectionKind::Linear => ((cr, cc), (ar, ac)),
+            SelectionKind::Block => ((ar.min(cr), ac.min(cc)), (ar.max(cr), ac.max(cc))),
         }
     }
 
@@ -218,7 +253,7 @@ impl Selection {
         if row < sr || row > er {
             return false;
         }
-        if sr == er {
+        if self.is_block() || sr == er {
             col >= sc && col <= ec
         } else if row == sr {
             col >= sc
@@ -473,6 +508,19 @@ mod tests {
         assert!(sel.contains(4, 0, None));
         assert!(sel.contains(4, 10, None));
         assert!(!sel.contains(4, 11, None));
+    }
+
+    #[test]
+    fn block_selection_normalizes_corners_and_contains_only_rectangle() {
+        let mut sel = Selection::block_anchor(PaneId::from_raw(0), 4, 10, None);
+        sel.drag(5, 2, Rect::new(0, 0, 80, 24), None);
+
+        assert_eq!(sel.ordered_cells(), ((2, 5), (4, 10)));
+        assert!(sel.contains(2, 5, None));
+        assert!(sel.contains(3, 7, None));
+        assert!(sel.contains(4, 10, None));
+        assert!(!sel.contains(2, 4, None));
+        assert!(!sel.contains(3, 11, None));
     }
 
     #[test]

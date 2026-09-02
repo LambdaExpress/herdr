@@ -2297,8 +2297,29 @@ impl HeadlessServer {
         );
     }
 
+    fn handle_file_manager_open_with(
+        &mut self,
+        path: &std::path::Path,
+        open: impl FnOnce(&std::path::Path) -> std::io::Result<Option<std::process::Child>>,
+    ) {
+        let foreground_is_local = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get(&client_id))
+            .is_some_and(|client| !client.remote);
+        if foreground_is_local {
+            if let Some(path) = path.to_str() {
+                if self.send_to_foreground_client(ServerMessage::OpenInFileManager {
+                    path: path.to_owned(),
+                }) {
+                    return;
+                }
+            }
+        }
+        self.app.open_in_file_manager_path_with(path, open);
+    }
+
     /// Handles a single internal event with forwarding logic for clipboard,
-    /// sound, and toast notifications to connected clients.
+    /// file-manager opens, sound, and toast notifications to connected clients.
     ///
     /// ALL internal events MUST be routed through this method to ensure
     /// clipboard/notify forwarding is never bypassed. Do not call
@@ -2325,6 +2346,10 @@ impl HeadlessServer {
                     self.app.show_clipboard_feedback();
                 }
                 true
+            }
+            AppEvent::OpenInFileManager { path } => {
+                self.handle_file_manager_open_with(path, crate::platform::open_in_file_manager);
+                false
             }
             AppEvent::PrefixInputSource { active } => {
                 // Input-source switching is a client-local host side effect; forward it to the
@@ -2600,11 +2625,12 @@ impl HeadlessServer {
         }
     }
 
-    /// Drains internal events, forwarding clipboard, sound, and toast
+    /// Drains internal events, forwarding clipboard, file-manager opens, sound, and toast
     /// notifications to connected clients instead of processing them locally.
     ///
     /// In the monolithic mode:
     /// - `ClipboardWrite` events are written to stdout via `write_osc52_bytes`.
+    /// - `OpenInFileManager` events run the host's graphical file-manager opener.
     /// - Sound notifications are played locally via `sound::play`.
     /// - Toast notifications are set on AppState and rendered into the frame.
     ///
@@ -2612,6 +2638,8 @@ impl HeadlessServer {
     /// so we:
     /// - Forward `ClipboardWrite` as `ServerMessage::Clipboard` to the
     ///   foreground client only.
+    /// - Forward `OpenInFileManager` to the foreground local client, while remote
+    ///   clients retain server-side opening for server-local project paths.
     /// - Detect when a sound would be played and forward as
     ///   `ServerMessage::Notify { kind: Sound }` to the foreground client.
     /// - Detect when a toast is set on AppState and forward as
@@ -3059,6 +3087,13 @@ impl HeadlessServer {
                 self.resize_shared_runtime_to_effective_size();
                 self.nudge_handoff_panes_on_first_client_attach();
                 true
+            }
+            ServerEvent::ClientEnvironment { client_id, remote } => {
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    return false;
+                };
+                client.remote = remote;
+                false
             }
             ServerEvent::GraphicsTransmissionResult {
                 client_id,
@@ -10658,6 +10693,79 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
             "background client should not receive clipboard writes"
+        );
+    }
+
+    #[test]
+    fn file_manager_open_targets_foreground_local_client() {
+        let mut server = test_headless_server();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let changed = server.handle_internal_event_with_forwarding(AppEvent::OpenInFileManager {
+            path: r"D:\project\herdr".into(),
+        });
+
+        assert!(!changed);
+        match read_server_message(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("foreground file-manager message"),
+        ) {
+            ServerMessage::OpenInFileManager { path } => {
+                assert_eq!(path, r"D:\project\herdr");
+            }
+            other => panic!("expected file-manager message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_client_keeps_file_manager_open_on_server_host() {
+        let mut server = test_headless_server();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        assert!(!server.handle_server_event(ServerEvent::ClientEnvironment {
+            client_id: 1,
+            remote: true,
+        }));
+
+        let opened = std::cell::Cell::new(false);
+        server.handle_file_manager_open_with(std::path::Path::new("/srv/project"), |path| {
+            assert_eq!(path, std::path::Path::new("/srv/project"));
+            opened.set(true);
+            Ok(None)
+        });
+
+        assert!(opened.get());
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "remote client should not receive a server-local path"
         );
     }
 

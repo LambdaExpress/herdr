@@ -4,6 +4,9 @@
 
 ### Added
 - Experimental pane graphics now render through SIXEL when the Herdr client is hosted by Windows Terminal, while Kitty-compatible terminals keep the existing Kitty output path.
+- Workspace context menus can now copy the selected project's path or open it in the native file manager when a graphical desktop is available.
+- Agent sidebar entries now open their corresponding tab context menu on right-click.
+- Holding Alt while dragging in a terminal pane now selects and copies a rectangular block of text.
 
 ## [0.8.2] - 2026-08-19
 
@@ -32,6 +35,7 @@
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 
 ### Fixed
+- Windows project-path opens now run through the foreground local client and create a new File Explorer window instead of reusing one in the background.
 - Windows Terminal pane graphics now fill every SIXEL row instead of leaving regular horizontal gaps between image bands.
 - Unix CLI commands now exit quietly when a downstream pipe closes instead of panicking with exit 101. (#2994)
 - The terminal theme now keeps the active Space row fill visible when the Navigate cursor lands on it, in both expanded and collapsed sidebars. (#2987)

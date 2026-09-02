@@ -466,14 +466,38 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
-pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
+pub fn file_manager_available() -> bool {
+    let display = std::env::var_os("DISPLAY");
+    let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+    graphical_session_available(display.as_deref(), wayland_display.as_deref())
+}
+
+fn graphical_session_available(
+    display: Option<&std::ffi::OsStr>,
+    wayland_display: Option<&std::ffi::OsStr>,
+) -> bool {
+    display.is_some_and(|value| !value.is_empty())
+        || wayland_display.is_some_and(|value| !value.is_empty())
+}
+
+fn spawn_xdg_open(target: &std::ffi::OsStr) -> std::io::Result<Option<std::process::Child>> {
     Command::new("xdg-open")
-        .arg(url)
+        .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(Some)
+}
+
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
+    spawn_xdg_open(std::ffi::OsStr::new(url))
+}
+
+pub fn open_in_file_manager(
+    path: &std::path::Path,
+) -> std::io::Result<Option<std::process::Child>> {
+    spawn_xdg_open(path.as_os_str())
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -758,6 +782,21 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn file_manager_requires_a_nonempty_graphical_display() {
+        let empty = std::ffi::OsStr::new("");
+        assert!(!graphical_session_available(None, None));
+        assert!(!graphical_session_available(Some(empty), Some(empty)));
+        assert!(graphical_session_available(
+            Some(std::ffi::OsStr::new(":0")),
+            None
+        ));
+        assert!(graphical_session_available(
+            None,
+            Some(std::ffi::OsStr::new("wayland-0"))
+        ));
     }
 
     #[test]

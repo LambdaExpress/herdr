@@ -759,6 +759,32 @@ pub(crate) fn handle_confirm_close_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
+fn workspace_project_path(
+    state: &AppState,
+    terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ws_idx: usize,
+) -> Option<std::path::PathBuf> {
+    state.workspaces.get(ws_idx).and_then(|workspace| {
+        workspace
+            .worktree_space()
+            .map(|space| space.checkout_path.clone())
+            .or_else(|| workspace.git_space().map(|space| space.repo_root.clone()))
+            .or_else(|| workspace.resolved_identity_cwd_from(&state.terminals, terminal_runtimes))
+    })
+}
+
+fn request_workspace_project_path_copy(
+    state: &mut AppState,
+    terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ws_idx: usize,
+) {
+    if let Some(path) = workspace_project_path(state, terminal_runtimes, ws_idx) {
+        state.request_clipboard_write =
+            Some(crate::platform::path_for_user_display(&path).into_bytes());
+    }
+    leave_modal(state);
+}
+
 #[cfg(test)]
 pub(super) fn apply_context_menu_action(
     state: &mut AppState,
@@ -802,13 +828,24 @@ pub(super) fn apply_context_menu_action(
             leave_modal(state);
         }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Rename"),
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
         }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Copy project path"),
+        ) => request_workspace_project_path_copy(state, terminal_runtimes, ws_idx),
+        (
+            ContextMenuKind::Workspace { .. } | ContextMenuKind::GitWorkspace { .. },
+            Some("Open in file manager"),
+        ) => leave_modal(state),
+        (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Close" | "Close group"),
         ) => {
             state.selected = ws_idx;
@@ -1194,6 +1231,19 @@ impl App {
         }
     }
 
+    fn request_workspace_project_path_open(&mut self, ws_idx: usize) {
+        if let Some(path) = workspace_project_path(&self.state, &self.terminal_runtimes, ws_idx) {
+            if self
+                .event_tx
+                .try_send(crate::events::AppEvent::OpenInFileManager { path })
+                .is_err()
+            {
+                tracing::warn!("failed to queue file manager open event");
+            }
+        }
+        leave_modal(&mut self.state);
+    }
+
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
         let item = menu.items().get(idx).copied();
         match (menu.kind, item) {
@@ -1232,12 +1282,29 @@ impl App {
                 leave_modal(&mut self.state);
             }
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Rename"),
             ) => open_rename_workspace(&mut self.state, &self.terminal_runtimes, ws_idx),
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Copy project path"),
+            ) => {
+                request_workspace_project_path_copy(
+                    &mut self.state,
+                    &self.terminal_runtimes,
+                    ws_idx,
+                );
+                self.dispatch_pending_clipboard_write();
+            }
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Open in file manager"),
+            ) => self.request_workspace_project_path_open(ws_idx),
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Close" | "Close group"),
             ) => {
@@ -1469,6 +1536,51 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    #[test]
+    fn context_menu_copy_project_path_dispatches_clicked_workspace_checkout() {
+        let mut app = app_with_test_workspaces(&["active", "clicked"]);
+        mark_worktree_space_member(&mut app.state, 1, "repo-key");
+        let (stored_path, expected_path) = if cfg!(windows) {
+            (r"\\?\D:\project\herdr", r"D:\project\herdr")
+        } else {
+            ("/repo/worktree-1", "/repo/worktree-1")
+        };
+        app.state.workspaces[1]
+            .worktree_space
+            .as_mut()
+            .expect("worktree membership")
+            .checkout_path = stored_path.into();
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 1,
+                is_linked_worktree: true,
+                has_worktree_children: false,
+                collapsed: false,
+                file_manager_available: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy project path")
+            .expect("copy project path item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        match app.event_rx.try_recv().expect("clipboard write event") {
+            crate::events::AppEvent::ClipboardWrite { content } => {
+                assert_eq!(content, expected_path.as_bytes());
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.active, Some(0));
     }
 
     #[test]
@@ -2182,6 +2294,50 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_open_file_manager_queues_clicked_workspace_checkout() {
+        let mut app = app_with_test_workspaces(&["active", "clicked"]);
+        mark_worktree_space_member(&mut app.state, 1, "repo-key");
+        let expected_path = if cfg!(windows) {
+            r"\\?\D:\project\herdr"
+        } else {
+            "/repo/worktree-1"
+        };
+        app.state.workspaces[1]
+            .worktree_space
+            .as_mut()
+            .expect("worktree membership")
+            .checkout_path = expected_path.into();
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 1,
+                is_linked_worktree: true,
+                has_worktree_children: false,
+                collapsed: false,
+                file_manager_available: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Open in file manager")
+            .expect("open in file manager item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        match app.event_rx.try_recv().expect("file manager open event") {
+            crate::events::AppEvent::OpenInFileManager { path } => {
+                assert_eq!(path, std::path::Path::new(expected_path));
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
     fn context_menu_close_group_opens_group_close_confirmation() {
         let mut state = state_with_workspaces(&["main", "issue"]);
         state.active = Some(0);
@@ -2206,6 +2362,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed: false,
+                file_manager_available: false,
             },
             x: 0,
             y: 0,
@@ -2213,7 +2370,12 @@ mod tests {
         };
         let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
-        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 1);
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close group")
+            .expect("close group item");
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, close_idx);
 
         assert_eq!(state.selected, 0);
         assert_eq!(state.mode, Mode::ConfirmClose);

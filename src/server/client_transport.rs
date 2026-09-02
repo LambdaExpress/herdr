@@ -319,6 +319,8 @@ pub(crate) enum ServerEvent {
         direct_graphics: bool,
         writer: ClientWriter,
     },
+    /// A connected app client reported whether it uses Herdr's remote transport.
+    ClientEnvironment { client_id: u64, remote: bool },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
     /// A client reported the one armed Kitty regular-file response.
@@ -780,6 +782,9 @@ fn client_read_loop(
         };
 
         let event = match msg {
+            ClientMessage::ClientEnvironment { remote } => {
+                ServerEvent::ClientEnvironment { client_id, remote }
+            }
             ClientMessage::Input { data } => {
                 // Validate input size.
                 if data.len() > MAX_INPUT_PAYLOAD {

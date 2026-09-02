@@ -1196,12 +1196,14 @@ pub(crate) struct TabPressState {
 pub enum ContextMenuKind {
     Workspace {
         ws_idx: usize,
+        file_manager_available: bool,
     },
     GitWorkspace {
         ws_idx: usize,
         is_linked_worktree: bool,
         has_worktree_children: bool,
         collapsed: bool,
+        file_manager_available: bool,
     },
     Tab {
         ws_idx: usize,
@@ -1225,31 +1227,59 @@ pub struct ContextMenuState {
     pub list: MenuListState,
 }
 
+fn workspace_context_menu_items(
+    file_manager_available: bool,
+    trailing_items: &[&'static str],
+) -> Vec<&'static str> {
+    let mut items =
+        Vec::with_capacity(2 + usize::from(file_manager_available) + trailing_items.len());
+    items.extend(["Rename", "Copy project path"]);
+    if file_manager_available {
+        items.push("Open in file manager");
+    }
+    items.extend_from_slice(trailing_items);
+    items
+}
+
 impl ContextMenuState {
     pub fn items(&self) -> Vec<&'static str> {
         match self.kind {
-            ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
+            ContextMenuKind::Workspace {
+                file_manager_available,
+                ..
+            } => workspace_context_menu_items(file_manager_available, &["Close"]),
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
+                file_manager_available,
                 ..
-            } => vec!["Rename", "Close", "New worktree", "Open worktree..."],
+            } => workspace_context_menu_items(
+                file_manager_available,
+                &["Close", "New worktree", "Open worktree..."],
+            ),
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: true,
+                file_manager_available,
                 ..
-            } => vec!["Rename", "Close", "Delete worktree checkout..."],
+            } => workspace_context_menu_items(
+                file_manager_available,
+                &["Close", "Delete worktree checkout..."],
+            ),
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed,
+                file_manager_available,
                 ..
-            } => vec![
-                "Rename",
-                "Close group",
-                "New worktree",
-                "Open worktree...",
-                if collapsed { "Expand" } else { "Collapse" },
-            ],
+            } => workspace_context_menu_items(
+                file_manager_available,
+                &[
+                    "Close group",
+                    "New worktree",
+                    "Open worktree...",
+                    if collapsed { "Expand" } else { "Collapse" },
+                ],
+            ),
             ContextMenuKind::Tab { .. } => vec!["New tab", "Rename", "Close"],
             ContextMenuKind::Pane {
                 source_pane_id,
@@ -2238,7 +2268,7 @@ impl AppState {
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")
                 }
@@ -2564,6 +2594,7 @@ mod tests {
                 is_linked_worktree: true,
                 has_worktree_children: false,
                 collapsed: false,
+                file_manager_available: true,
             },
             x: 0,
             y: 0,
@@ -2572,7 +2603,13 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "Delete worktree checkout..."]
+            &[
+                "Rename",
+                "Copy project path",
+                "Open in file manager",
+                "Close",
+                "Delete worktree checkout..."
+            ]
         );
     }
 
@@ -2584,6 +2621,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: false,
                 collapsed: false,
+                file_manager_available: true,
             },
             x: 0,
             y: 0,
@@ -2592,7 +2630,14 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "New worktree", "Open worktree..."]
+            &[
+                "Rename",
+                "Copy project path",
+                "Open in file manager",
+                "Close",
+                "New worktree",
+                "Open worktree..."
+            ]
         );
     }
 
@@ -2604,6 +2649,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed: false,
+                file_manager_available: true,
             },
             x: 0,
             y: 0,
@@ -2614,11 +2660,28 @@ mod tests {
             menu.items(),
             &[
                 "Rename",
+                "Copy project path",
+                "Open in file manager",
                 "Close group",
                 "New worktree",
                 "Open worktree...",
                 "Collapse"
             ]
         );
+    }
+
+    #[test]
+    fn workspace_context_menu_hides_file_manager_without_a_graphical_ui() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                file_manager_available: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert_eq!(menu.items(), &["Rename", "Copy project path", "Close"]);
     }
 }

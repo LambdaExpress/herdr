@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Direction, Rect};
 use tracing::warn;
 
@@ -637,7 +637,10 @@ impl AppState {
                         self.mode = Mode::Terminal;
                     }
 
-                    if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
+                    let block_selection = mouse.modifiers.contains(KeyModifiers::ALT);
+                    if !block_selection
+                        && self.forward_pane_mouse_button(terminal_runtimes, &info, mouse)
+                    {
                         self.selection = None;
                         self.selection_autoscroll = None;
                         return self.mouse_pane_focus_action(info.id);
@@ -647,12 +650,12 @@ impl AppState {
                         mouse.row - info.inner_rect.y,
                         mouse.column - info.inner_rect.x,
                     );
-                    self.selection = Some(Selection::anchor(
-                        info.id,
-                        row,
-                        col,
-                        self.pane_scroll_metrics(terminal_runtimes, info.id),
-                    ));
+                    let metrics = self.pane_scroll_metrics(terminal_runtimes, info.id);
+                    self.selection = Some(if block_selection {
+                        Selection::block_anchor(info.id, row, col, metrics)
+                    } else {
+                        Selection::anchor(info.id, row, col, metrics)
+                    });
                     return self.mouse_pane_focus_action(info.id);
                 } else if let Some(info) = self.view.pane_infos.iter().find(|p| {
                     mouse.column >= p.rect.x
@@ -1040,11 +1043,15 @@ impl AppState {
                 if self
                     .workspace_list_scrollbar_target_at(mouse.column, mouse.row)
                     .is_some()
+                    || self
+                        .agent_panel_scrollbar_target_at(mouse.column, mouse.row)
+                        .is_some()
                 {
                     return None;
                 }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected = idx;
+                    let file_manager_available = crate::platform::file_manager_available();
                     let kind = self
                         .workspaces
                         .get(idx)
@@ -1074,11 +1081,25 @@ impl AppState {
                                 collapsed: group_state
                                     .as_ref()
                                     .is_some_and(|(_, collapsed)| *collapsed),
+                                file_manager_available,
                             })
                         })
-                        .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
+                        .unwrap_or(ContextMenuKind::Workspace {
+                            ws_idx: idx,
+                            file_manager_available,
+                        });
                     self.context_menu = Some(ContextMenuState {
                         kind,
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
+                } else if let Some((ws_idx, tab_idx, _pane_id)) =
+                    self.agent_detail_target_at(mouse.row)
+                {
+                    self.context_menu = Some(ContextMenuState {
+                        kind: ContextMenuKind::Tab { ws_idx, tab_idx },
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
@@ -3280,7 +3301,10 @@ mod tests {
     fn hovering_context_menu_updates_highlight() {
         let mut app = app_for_mouse_test();
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 0 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                file_manager_available: false,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(0),
@@ -3291,6 +3315,59 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Moved, menu.x + 2, menu.y + 2));
 
         assert_eq!(app.state.context_menu.unwrap().list.highlighted, 1);
+    }
+
+    #[test]
+    fn right_clicking_agent_detail_row_opens_its_tab_context_menu() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("Studio");
+        let target_tab_idx = ws.test_add_tab(Some("agents"));
+        let target_pane = ws.tabs[target_tab_idx].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0].tabs[target_tab_idx].panes[&target_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(Agent::Pi);
+        terminal.state = AgentState::Working;
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 106, 30);
+        crate::ui::compute_view(&mut app.state, area);
+        let panel = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, panel);
+        let body =
+            crate::ui::agent_panel_body_rect(panel, crate::ui::should_show_scrollbar(metrics));
+        let target_row = (body.y..body.y + body.height)
+            .find(|row| {
+                app.state.agent_detail_target_at(*row) == Some((0, target_tab_idx, target_pane))
+            })
+            .expect("target agent row should be visible");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            body.x,
+            target_row,
+        ));
+
+        let menu = app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("right click should open a context menu");
+        assert_eq!(
+            menu.kind,
+            ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: target_tab_idx,
+            }
+        );
+        assert_eq!(menu.items(), &["New tab", "Rename", "Close"]);
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert_eq!(app.state.workspaces[0].active_tab, 0);
     }
 
     #[test]
@@ -3574,10 +3651,13 @@ mod tests {
         app.state.mode = Mode::Terminal;
 
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                file_manager_available: false,
+            },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
+            list: MenuListState::new(2),
         });
         app.state.mode = Mode::ContextMenu;
         handle_context_menu_key(
@@ -3614,10 +3694,13 @@ mod tests {
         app.state.selected = 0;
         app.state.confirm_close = false;
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                file_manager_available: false,
+            },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
+            list: MenuListState::new(2),
         });
         app.state.mode = Mode::ContextMenu;
 
@@ -3625,7 +3708,7 @@ mod tests {
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             menu.x + 2,
-            menu.y + 2,
+            menu.y + 3,
         ));
 
         assert_eq!(app.state.workspaces.len(), 1);

@@ -109,6 +109,28 @@ impl App {
         let _ = self.handle_internal_event_with_pane_updates(ev);
     }
 
+    pub(crate) fn open_in_file_manager_path(&mut self, path: &std::path::Path) {
+        self.open_in_file_manager_path_with(path, crate::platform::open_in_file_manager);
+    }
+
+    pub(crate) fn open_in_file_manager_path_with(
+        &mut self,
+        path: &std::path::Path,
+        open: impl FnOnce(&std::path::Path) -> std::io::Result<Option<std::process::Child>>,
+    ) {
+        match open(path) {
+            Ok(Some(child)) => self.detached_process_children.push(child),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    err = %err,
+                    path = %path.display(),
+                    "failed to open project path in file manager"
+                );
+            }
+        }
+    }
+
     pub(crate) fn handle_internal_event_with_pane_updates(
         &mut self,
         ev: AppEvent,
@@ -128,6 +150,11 @@ impl App {
             #[cfg(test)]
             let _ = content;
             self.show_clipboard_feedback();
+            return Vec::new();
+        }
+
+        if let AppEvent::OpenInFileManager { path } = &ev {
+            self.open_in_file_manager_path(path);
             return Vec::new();
         }
 

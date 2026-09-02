@@ -1313,6 +1313,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alt_drag_copies_block_selection_instead_of_forwarding_mouse_gesture() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                0,
+                b"\x1b[?1002h\x1b[?1006habcdef\r\n012345\r\nuvwxyz",
+                4,
+            );
+        ws.insert_test_runtime(pane_id, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+
+        let start_col = info.inner_rect.x + 1;
+        let start_row = info.inner_rect.y;
+        let end_col = info.inner_rect.x + 3;
+        let end_row = info.inner_rect.y + 2;
+        app.handle_mouse(modified_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start_col,
+            start_row,
+            KeyModifiers::ALT,
+        ));
+        app.handle_mouse(modified_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end_col,
+            end_row,
+            KeyModifiers::ALT,
+        ));
+        app.handle_mouse(modified_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            end_col,
+            end_row,
+            KeyModifiers::ALT,
+        ));
+
+        assert_eq!(clipboard_write_content(&mut app), b"bcd\n123\nvwx");
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.state.selection.is_none());
+    }
+
+    #[tokio::test]
     async fn wheel_scroll_keeps_in_progress_selection_and_extends_it() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");

@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_void, OsStr},
     mem::{size_of, MaybeUninit},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     path::PathBuf,
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
@@ -71,8 +74,9 @@ use windows_sys::{
                 NIIF_INFO, NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowThreadProcessId,
-                LoadIconW, SendMessageTimeoutW, IDI_APPLICATION, SMTO_ABORTIFHUNG, WM_IME_CONTROL,
+                AllowSetForegroundWindow, CreateWindowExW, DestroyWindow, GetForegroundWindow,
+                GetShellWindow, GetWindowThreadProcessId, LoadIconW, SendMessageTimeoutW, ASFW_ANY,
+                IDI_APPLICATION, SMTO_ABORTIFHUNG, WM_IME_CONTROL,
             },
         },
     },
@@ -112,6 +116,17 @@ pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
             .map(PathBuf::from)
             .map(|dir| dir.join("ssh").join("ssh_config")),
         multiplexing: false,
+    }
+}
+
+pub(crate) fn path_for_user_display_platform(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        path.to_owned()
+    } else {
+        path.into_owned()
     }
 }
 
@@ -1889,14 +1904,18 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
-pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
+pub fn file_manager_available() -> bool {
+    !unsafe { GetShellWindow() }.is_null()
+}
+
+fn shell_execute_open(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
+    let target: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
     let operation = wide_null("open");
-    let url = wide_null(url);
     let result = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             operation.as_ptr(),
-            url.as_ptr(),
+            target.as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             1,
@@ -1906,10 +1925,46 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
         Ok(None)
     } else {
         Err(std::io::Error::other(format!(
-            "failed to open URL with ShellExecuteW: code {}",
+            "failed to open target with ShellExecuteW: code {}",
             result as isize
         )))
     }
+}
+
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
+    shell_execute_open(OsStr::new(url))
+}
+
+fn file_manager_command(
+    path: &std::path::Path,
+    system_root: Option<&OsStr>,
+) -> std::io::Result<std::process::Command> {
+    let system_root = system_root.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "SystemRoot is unavailable; cannot locate explorer.exe",
+        )
+    })?;
+    let mut command = std::process::Command::new(PathBuf::from(system_root).join("explorer.exe"));
+    command
+        .arg("/n,")
+        .arg(path_for_user_display_platform(path))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Ok(command)
+}
+
+pub fn open_in_file_manager(
+    path: &std::path::Path,
+) -> std::io::Result<Option<std::process::Child>> {
+    let system_root = std::env::var_os("SystemRoot");
+    if unsafe { AllowSetForegroundWindow(ASFW_ANY) } == 0 {
+        tracing::debug!("foreground permission unavailable for explorer.exe");
+    }
+    file_manager_command(path, system_root.as_deref())?
+        .spawn()
+        .map(Some)
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -2520,6 +2575,45 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
+
+    #[test]
+    fn user_display_path_removes_windows_verbatim_prefixes() {
+        assert_eq!(
+            super::path_for_user_display_platform(std::path::Path::new(r"\\?\D:\project\herdr")),
+            r"D:\project\herdr"
+        );
+        assert_eq!(
+            super::path_for_user_display_platform(std::path::Path::new(
+                r"\\?\UNC\server\share\project"
+            )),
+            r"\\server\share\project"
+        );
+        assert_eq!(
+            super::path_for_user_display_platform(std::path::Path::new(r"D:\project\herdr")),
+            r"D:\project\herdr"
+        );
+    }
+
+    #[test]
+    fn file_manager_command_forces_a_new_explorer_window() {
+        let command = super::file_manager_command(
+            std::path::Path::new(r"\\?\D:\project space\herdr"),
+            Some(std::ffi::OsStr::new(r"C:\Windows")),
+        )
+        .expect("build explorer command");
+
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new(r"C:\Windows\explorer.exe")
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("/n,"),
+                std::ffi::OsStr::new(r"D:\project space\herdr")
+            ]
+        );
+    }
 
     #[test]
     fn private_remote_directory_supports_long_paths() {

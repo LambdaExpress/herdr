@@ -98,6 +98,8 @@ struct ClientState {
     repaint_pending: bool,
     /// Whether this client draws the cursor into frame cells instead of using the host cursor.
     draw_host_cursor: bool,
+    /// File-manager opener children awaiting non-blocking reap.
+    detached_process_children: Vec<std::process::Child>,
 }
 
 #[derive(Debug, Default)]
@@ -231,6 +233,33 @@ fn attach_scroll_action(
 impl ClientState {
     fn request_repaint(&mut self) {
         self.repaint_pending = true;
+    }
+
+    fn open_in_file_manager(&mut self, path: &str) {
+        match crate::platform::open_in_file_manager(std::path::Path::new(path)) {
+            Ok(Some(child)) => self.detached_process_children.push(child),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(err = %err, path, "failed to open project path in file manager");
+            }
+        }
+    }
+
+    fn reap_finished_detached_processes(&mut self) {
+        self.detached_process_children
+            .retain_mut(|child| match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(_)) => false,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => true,
+                Err(err) => {
+                    tracing::warn!(
+                        pid = child.id(),
+                        err = %err,
+                        "failed to reap client file-manager opener"
+                    );
+                    false
+                }
+            });
     }
 }
 
@@ -1280,6 +1309,14 @@ fn run_client_with_mode(
         }
     };
 
+    let environment = ClientMessage::ClientEnvironment {
+        remote: is_remote_client_process(),
+    };
+    if let Err(err) = write_to_server(&mut stream, &environment) {
+        eprintln!("herdr: failed to report client environment: {err}");
+        std::process::exit(1);
+    }
+
     if let Some((terminal_id, takeover)) = attach_request {
         let attach = ClientMessage::AttachTerminal {
             terminal_id,
@@ -1421,6 +1458,7 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         draw_host_cursor,
+        detached_process_children: Vec::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1894,6 +1932,9 @@ async fn run_client_loop(
                         prefix_input_source.restore();
                     }
                 }
+                ServerMessage::OpenInFileManager { path } => {
+                    state.open_in_file_manager(&path);
+                }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
                 }
@@ -1905,6 +1946,7 @@ async fn run_client_loop(
                 )));
             }
             ClientLoopEvent::Timer => {
+                state.reap_finished_detached_processes();
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();

@@ -313,6 +313,7 @@ pub(crate) enum ServerEvent {
         cell_width_px: u32,
         cell_height_px: u32,
         render_encoding: RenderEncoding,
+        host_graphics_protocol: crate::protocol::HostGraphicsProtocol,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
         direct_graphics: bool,
@@ -560,6 +561,7 @@ pub(crate) fn handle_client_handshake(
         cell_width_px,
         cell_height_px,
         render_encoding,
+        host_graphics_protocol,
         keybindings,
         direct_attach_requested,
         direct_graphics,
@@ -571,6 +573,7 @@ pub(crate) fn handle_client_handshake(
             cell_width_px,
             cell_height_px,
             requested_encoding,
+            host_graphics_protocol,
             keybindings,
             launch_mode,
         } => {
@@ -610,6 +613,7 @@ pub(crate) fn handle_client_handshake(
                 cell_width_px,
                 cell_height_px,
                 requested_encoding,
+                host_graphics_protocol,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
@@ -674,6 +678,7 @@ pub(crate) fn handle_client_handshake(
         cell_width_px,
         cell_height_px,
         render_encoding,
+        host_graphics_protocol,
         keybindings,
         direct_attach_requested,
         direct_graphics,
@@ -1328,6 +1333,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::TerminalAnsi,
+                host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
             },
@@ -1360,6 +1366,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px,
                 cell_height_px,
                 render_encoding,
+                host_graphics_protocol,
                 keybindings,
                 direct_attach_requested,
                 direct_graphics,
@@ -1369,6 +1376,10 @@ new_tab = "ctrl+notakey"
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
+                assert_eq!(
+                    host_graphics_protocol,
+                    crate::protocol::HostGraphicsProtocol::Kitty
+                );
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
                 assert!(!direct_graphics);
@@ -1405,6 +1416,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::TerminalAnsi,
+                host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Disabled,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
             },

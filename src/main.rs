@@ -10,6 +10,7 @@ use crossterm::execute;
 
 pub(crate) const HERDR_ENV_VAR: &str = "HERDR_ENV";
 pub(crate) const HERDR_ENV_VALUE: &str = "1";
+pub(crate) const HERDR_KITTY_GRAPHICS_ENV_VAR: &str = "HERDR_KITTY_GRAPHICS";
 const NESTED_HERDR_MESSAGES: [&str; 6] = [
     "inception detected. we need to go deeper... said no one ever.",
     "recursion is a pathway to many abilities some consider to be... unnatural.",

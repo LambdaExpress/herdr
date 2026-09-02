@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
@@ -153,12 +154,63 @@ pub(crate) fn is_enabled() -> bool {
     KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire)
 }
 
+pub(crate) fn host_graphics_protocol(enabled: bool) -> crate::protocol::HostGraphicsProtocol {
+    host_graphics_protocol_for_env(enabled, |name| std::env::var_os(name))
+}
+
+fn host_graphics_protocol_for_env(
+    enabled: bool,
+    mut env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> crate::protocol::HostGraphicsProtocol {
+    use crate::protocol::HostGraphicsProtocol;
+
+    if !enabled {
+        return HostGraphicsProtocol::Disabled;
+    }
+
+    let term_program = env("TERM_PROGRAM")
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_default();
+    let known_kitty_host = env("KITTY_WINDOW_ID").is_some()
+        || env("GHOSTTY_RESOURCES_DIR").is_some()
+        || env("WEZTERM_PANE").is_some()
+        || matches!(
+            term_program.to_ascii_lowercase().as_str(),
+            "kitty" | "ghostty" | "wezterm"
+        );
+    if known_kitty_host {
+        HostGraphicsProtocol::Kitty
+    } else if env("WT_SESSION").is_some() {
+        HostGraphicsProtocol::Sixel
+    } else {
+        HostGraphicsProtocol::Kitty
+    }
+}
+
 pub(crate) fn paint_local_pane_graphics(
     app: &AppState,
     graphics: &crate::app::pane_graphics::Runtime,
     terminal_runtimes: &TerminalRuntimeRegistry,
     cell_size: HostCellSize,
 ) -> io::Result<()> {
+    if host_graphics_protocol(true).is_sixel() {
+        let encoded = encode_local_pane_graphics_sixel(
+            app,
+            graphics,
+            terminal_runtimes,
+            app.view.tab_surface(),
+            cell_size,
+        );
+        if encoded.bytes.is_empty() {
+            return Ok(());
+        }
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"\x1b7")?;
+        stdout.write_all(&encoded.bytes)?;
+        stdout.write_all(b"\x1b8")?;
+        return stdout.flush();
+    }
+
     let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
     let Ok(mut cache) = cache.lock() else {
         return Ok(());
@@ -274,6 +326,183 @@ pub(crate) fn encode_local_pane_graphics(
     // display cached images again even when their data and geometry are unchanged.
     cache.request_placement_replay();
     encode_graphics_update_incremental(cache, &placements, &live_pane_sources, transaction_budget)
+}
+
+pub(crate) fn encode_local_pane_graphics_sixel(
+    app: &AppState,
+    graphics: &crate::app::pane_graphics::Runtime,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    surface: crate::ui::TabSurfaceView<'_>,
+    cell_size: HostCellSize,
+) -> EncodedGraphics {
+    if app.mode != Mode::Terminal || !cell_size.is_known() {
+        return EncodedGraphics {
+            bytes: Vec::new(),
+            incomplete: false,
+        };
+    }
+
+    let mut placements = collect_visible_placements(
+        app,
+        graphics,
+        terminal_runtimes,
+        surface,
+        cell_size,
+        &HashMap::new(),
+    );
+    placements.sort_by_key(|placement| (placement.placement.z, placement.area.y, placement.area.x));
+
+    let mut bytes = Vec::new();
+    for placement in &placements {
+        if let Some(encoded) = encode_sixel_placement(placement) {
+            bytes.extend(encoded);
+        }
+    }
+    EncodedGraphics {
+        bytes,
+        incomplete: false,
+    }
+}
+
+struct DecodedRgba<'a> {
+    width: u32,
+    height: u32,
+    data: Cow<'a, [u8]>,
+}
+
+fn encode_sixel_placement(placement: &HostPlacement) -> Option<Vec<u8>> {
+    let (clipped, _) = clipped_placement(placement)?;
+    let source = decode_placement_rgba(placement)?;
+    let source_right = clipped.source_x.checked_add(clipped.source_width)?;
+    let source_bottom = clipped.source_y.checked_add(clipped.source_height)?;
+    if source_right > source.width || source_bottom > source.height {
+        return None;
+    }
+
+    let raw_width = clipped.cols.checked_mul(placement.cell_size.width_px)?;
+    let raw_height = clipped.rows.checked_mul(placement.cell_size.height_px)?;
+    if raw_width == 0 || raw_height == 0 {
+        return None;
+    }
+    let target_height = (raw_height / 6).max(1).checked_mul(6)?;
+    let target_width = ((u64::from(raw_width) * u64::from(target_height)
+        + u64::from(raw_height) / 2)
+        / u64::from(raw_height))
+    .max(1)
+    .min(u64::from(u32::MAX)) as u32;
+    let x_offset = ((u64::from(clipped.x_offset) * u64::from(target_height)
+        + u64::from(raw_height) / 2)
+        / u64::from(raw_height))
+    .min(u64::from(target_width)) as u32;
+    let y_offset = ((u64::from(clipped.y_offset) * u64::from(target_height)
+        + u64::from(raw_height) / 2)
+        / u64::from(raw_height))
+    .min(u64::from(target_height)) as u32;
+    let rgba = crop_scale_rgba(
+        &source,
+        clipped,
+        target_width,
+        target_height,
+        x_offset,
+        y_offset,
+    )?;
+    let sixel = icy_sixel::sixel_encode(
+        &rgba,
+        target_width as usize,
+        target_height as usize,
+        &icy_sixel::EncodeOptions::default(),
+    )
+    .ok()?;
+
+    let mut encoded = Vec::with_capacity(sixel.len() + 24);
+    let _ = write!(encoded, "\x1b[{};{}H", clipped.y + 1, clipped.x + 1);
+    encoded.extend_from_slice(sixel.as_bytes());
+    Some(encoded)
+}
+
+fn decode_placement_rgba(placement: &HostPlacement) -> Option<DecodedRgba<'_>> {
+    let width = placement.placement.image_width;
+    let height = placement.placement.image_height;
+    let pixel_count = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    match placement.placement.format {
+        KittyImageFormat::Rgba => {
+            let expected = pixel_count.checked_mul(4)?;
+            (placement.placement.data.len() == expected).then(|| DecodedRgba {
+                width,
+                height,
+                data: Cow::Borrowed(&placement.placement.data),
+            })
+        }
+        KittyImageFormat::Rgb => {
+            let expected = pixel_count.checked_mul(3)?;
+            if placement.placement.data.len() != expected {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4)?);
+            for rgb in placement.placement.data.chunks_exact(3) {
+                rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            Some(DecodedRgba {
+                width,
+                height,
+                data: Cow::Owned(rgba),
+            })
+        }
+        KittyImageFormat::Png => {
+            let decoded = crate::ghostty::decode_png_rgba(&placement.placement.data)?;
+            Some(DecodedRgba {
+                width: decoded.width,
+                height: decoded.height,
+                data: Cow::Owned(decoded.data),
+            })
+        }
+    }
+}
+
+fn crop_scale_rgba(
+    source: &DecodedRgba<'_>,
+    clipped: ClippedPlacement,
+    target_width: u32,
+    target_height: u32,
+    x_offset: u32,
+    y_offset: u32,
+) -> Option<Vec<u8>> {
+    let target_pixels = usize::try_from(target_width)
+        .ok()?
+        .checked_mul(usize::try_from(target_height).ok()?)?;
+    let mut target = vec![0; target_pixels.checked_mul(4)?];
+    let content_width = target_width.saturating_sub(x_offset);
+    let content_height = target_height.saturating_sub(y_offset);
+    if content_width == 0 || content_height == 0 {
+        return Some(target);
+    }
+
+    let source_width = usize::try_from(source.width).ok()?;
+    for dest_y in 0..content_height {
+        let source_y = clipped.source_y
+            + ((u64::from(dest_y) * u64::from(clipped.source_height)) / u64::from(content_height))
+                as u32;
+        for dest_x in 0..content_width {
+            let source_x = clipped.source_x
+                + ((u64::from(dest_x) * u64::from(clipped.source_width)) / u64::from(content_width))
+                    as u32;
+            let source_index = usize::try_from(source_y)
+                .ok()?
+                .checked_mul(source_width)?
+                .checked_add(usize::try_from(source_x).ok()?)?
+                .checked_mul(4)?;
+            let target_index = usize::try_from(dest_y + y_offset)
+                .ok()?
+                .checked_mul(usize::try_from(target_width).ok()?)?
+                .checked_add(usize::try_from(dest_x + x_offset).ok()?)?
+                .checked_mul(4)?;
+            target[target_index..target_index + 4]
+                .copy_from_slice(&source.data[source_index..source_index + 4]);
+        }
+    }
+    Some(target)
 }
 
 pub(crate) fn has_visible_pane_graphics(
@@ -1590,6 +1819,40 @@ fn encode_kitty_data(out: &mut Vec<u8>, control: &str, data: &[u8]) {
 mod tests {
     use super::*;
 
+    fn protocol_for_env(
+        enabled: bool,
+        values: &[(&str, &str)],
+    ) -> crate::protocol::HostGraphicsProtocol {
+        host_graphics_protocol_for_env(enabled, |name| {
+            values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| std::ffi::OsString::from(value)))
+        })
+    }
+
+    #[test]
+    fn windows_terminal_selects_sixel_host_output() {
+        assert_eq!(
+            protocol_for_env(true, &[("WT_SESSION", "session")]),
+            crate::protocol::HostGraphicsProtocol::Sixel
+        );
+        assert_eq!(
+            protocol_for_env(false, &[("WT_SESSION", "session")]),
+            crate::protocol::HostGraphicsProtocol::Disabled
+        );
+    }
+
+    #[test]
+    fn known_kitty_host_takes_precedence_over_inherited_windows_terminal_marker() {
+        assert_eq!(
+            protocol_for_env(
+                true,
+                &[("WT_SESSION", "inherited"), ("TERM_PROGRAM", "WezTerm")]
+            ),
+            crate::protocol::HostGraphicsProtocol::Kitty
+        );
+    }
+
     #[test]
     fn fallback_cell_size_is_usable_only_for_nonempty_areas() {
         assert_eq!(
@@ -1642,6 +1905,25 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn sixel_placement_encodes_cursor_and_visible_pixel_geometry() {
+        let encoded = encode_sixel_placement(&test_placement(2, 1)).expect("SIXEL placement");
+        let text = String::from_utf8(encoded).unwrap();
+
+        assert!(text.starts_with("\x1b[2;3H\x1bP"));
+        assert!(text.contains("\"1;1;30;30"));
+        assert!(text.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn sixel_placement_applies_existing_viewport_crop() {
+        let encoded = encode_sixel_placement(&test_placement(-1, 0)).expect("cropped SIXEL");
+        let text = String::from_utf8(encoded).unwrap();
+
+        assert!(text.starts_with("\x1b[1;1H\x1bP"));
+        assert!(text.contains("\"1;1;20;30"));
     }
 
     fn pane_layer_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {

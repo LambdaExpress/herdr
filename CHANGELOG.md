@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Experimental pane graphics now render through SIXEL when the Herdr client is hosted by Windows Terminal, while Kitty-compatible terminals keep the existing Kitty output path.
+
 ## [0.8.2] - 2026-08-19
 
 ### Added

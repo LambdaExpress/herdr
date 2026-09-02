@@ -49,6 +49,43 @@ async fn cold_redraw_advances_one_bounded_layer_after_each_send() {
     assert_eq!(server.clients[&1].deferred_render(), DeferredRender::None);
 }
 
+#[tokio::test]
+async fn windows_terminal_client_receives_sixel_instead_of_kitty_commands() {
+    let (mut server, client_rx, pane_id) = retained_test_server(b"SIXEL");
+    server.app.state.kitty_graphics_enabled = true;
+    let client = server.clients.get_mut(&1).unwrap();
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    client.host_graphics_protocol = crate::protocol::HostGraphicsProtocol::Sixel;
+
+    let key = graphics_key(pane_id);
+    let host_image_id = server.app.pane_graphics.reserve_image_id(&key).unwrap();
+    let layer = crate::app::pane_graphics::Layer::inline(
+        api::schema::PaneGraphicsFormat::Rgba,
+        1,
+        1,
+        vec![255, 0, 0, 255],
+        api::schema::PaneGraphicsPlacementParams {
+            grid_cols: 2,
+            grid_rows: 1,
+            ..Default::default()
+        },
+        0,
+    );
+    server.app.pane_graphics.slots.insert(
+        key,
+        crate::app::pane_graphics::Slot::test(host_image_id, Some(layer)),
+    );
+
+    server.render_and_stream();
+    let frame = read_server_frame(receive_render(&client_rx, Duration::from_millis(100)));
+
+    assert!(frame.graphics.windows(2).any(|bytes| bytes == b"\x1bP"));
+    assert!(!frame.graphics.windows(3).any(|bytes| bytes == b"\x1b_G"));
+}
+
 fn enable_graphics_and_render(
     server: &mut HeadlessServer,
     client_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -315,6 +352,7 @@ fn direct_eligibility_is_installed_with_the_client_connection() {
         cell_width_px: 10,
         cell_height_px: 20,
         render_encoding: RenderEncoding::SemanticFrame,
+        host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
         keybindings: None,
         direct_attach_requested: false,
         direct_graphics: true,

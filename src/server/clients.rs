@@ -18,6 +18,7 @@ pub(crate) type RenderTarget = (
     crate::kitty_graphics::HostCellSize,
     bool,
     ClientConnectionMode,
+    crate::protocol::HostGraphicsProtocol,
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,6 +56,8 @@ pub(crate) struct ClientConnection {
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// Graphics protocol accepted by the client's outer terminal.
+    pub(crate) host_graphics_protocol: crate::protocol::HostGraphicsProtocol,
     /// Passive eligibility for audited local Kitty regular-file graphics.
     pub(crate) direct_graphics: bool,
     /// Whether this frontend preserves exact SGR pixel reports.
@@ -95,6 +98,7 @@ impl ClientConnection {
             outer_terminal_focus,
             last_activity,
             render_encoding,
+            crate::protocol::HostGraphicsProtocol::Kitty,
             false,
             writer,
         )
@@ -109,6 +113,7 @@ impl ClientConnection {
         outer_terminal_focus: Option<bool>,
         last_activity: u64,
         render_encoding: RenderEncoding,
+        host_graphics_protocol: crate::protocol::HostGraphicsProtocol,
         pending_terminal_attach: bool,
         writer: Option<ClientWriter>,
     ) -> Self {
@@ -128,6 +133,7 @@ impl ClientConnection {
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+            host_graphics_protocol,
             direct_graphics: false,
             pixel_mouse: false,
             graphics_surface_reset_pending: false,
@@ -307,10 +313,11 @@ pub(crate) fn render_targets(
                 client.cell_size,
                 foreground_client_id == Some(client_id),
                 client.mode.clone(),
+                client.host_graphics_protocol,
             )
         })
         .collect();
 
-    targets.sort_by_key(|(client_id, _, _, is_foreground, _)| (*is_foreground, *client_id));
+    targets.sort_by_key(|(client_id, _, _, is_foreground, _, _)| (*is_foreground, *client_id));
     targets
 }

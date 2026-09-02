@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -41,6 +41,32 @@ pub enum RenderEncoding {
     SemanticFrame,
     /// Send already-diffed terminal ANSI byte streams.
     TerminalAnsi,
+}
+
+/// Graphics protocol accepted by the client's outer terminal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostGraphicsProtocol {
+    /// Do not send terminal graphics payloads.
+    #[default]
+    Disabled,
+    /// Send Kitty graphics protocol payloads.
+    Kitty,
+    /// Send SIXEL payloads.
+    Sixel,
+}
+
+impl HostGraphicsProtocol {
+    pub(crate) fn is_enabled(self) -> bool {
+        self != Self::Disabled
+    }
+
+    pub(crate) fn is_kitty(self) -> bool {
+        self == Self::Kitty
+    }
+
+    pub(crate) fn is_sixel(self) -> bool {
+        self == Self::Sixel
+    }
 }
 
 /// Keybinding profile requested by an attached app client.
@@ -355,6 +381,8 @@ pub enum ClientMessage {
         cell_height_px: u32,
         /// Render encoding requested by the client.
         requested_encoding: RenderEncoding,
+        /// Graphics protocol accepted by the client's outer terminal.
+        host_graphics_protocol: HostGraphicsProtocol,
         /// Keybinding profile requested by the client.
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
@@ -535,7 +563,7 @@ pub struct FrameData {
     pub cursor: Option<CursorState>,
     /// OSC 8 hyperlink URIs referenced by cells.
     pub hyperlinks: Vec<String>,
-    /// Kitty graphics protocol bytes to apply after the text frame.
+    /// Host graphics protocol bytes to apply after the text frame.
     pub graphics: Vec<u8>,
 }
 
@@ -1040,6 +1068,7 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: HostGraphicsProtocol::Kitty,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
         };
@@ -1077,6 +1106,7 @@ mod tests {
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::SemanticFrame,
+                host_graphics_protocol: HostGraphicsProtocol::Kitty,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
             }),
@@ -1658,6 +1688,7 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: HostGraphicsProtocol::Kitty,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
         };
@@ -1732,6 +1763,7 @@ mod tests {
                     cell_width_px: 8,
                     cell_height_px: 16,
                     requested_encoding: RenderEncoding::SemanticFrame,
+                    host_graphics_protocol: HostGraphicsProtocol::Kitty,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
                 },
@@ -2168,6 +2200,7 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: HostGraphicsProtocol::Kitty,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
         };
@@ -2204,6 +2237,7 @@ mod tests {
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::SemanticFrame,
+                host_graphics_protocol: HostGraphicsProtocol::Kitty,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
             },

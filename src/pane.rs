@@ -78,6 +78,11 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // when the remote side lacks matching terminfo entries.
     cmd.env("TERM", PANE_TERM);
     cmd.env("COLORTERM", PANE_COLORTERM);
+    if crate::kitty_graphics::is_enabled() {
+        cmd.env(crate::HERDR_KITTY_GRAPHICS_ENV_VAR, "1");
+    } else {
+        cmd.env_remove(crate::HERDR_KITTY_GRAPHICS_ENV_VAR);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

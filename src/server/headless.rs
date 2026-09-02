@@ -3002,6 +3002,7 @@ impl HeadlessServer {
                 keybindings,
                 writer,
                 render_encoding,
+                host_graphics_protocol,
                 direct_attach_requested,
                 direct_graphics,
             } => {
@@ -3041,6 +3042,7 @@ impl HeadlessServer {
                     None,
                     last_activity,
                     render_encoding,
+                    host_graphics_protocol,
                     direct_attach_requested,
                     Some(writer),
                 );
@@ -4233,7 +4235,7 @@ impl HeadlessServer {
         }
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
-        let [(client_id, (cols, rows), cell_size, _is_foreground, mode)] =
+        let [(client_id, (cols, rows), cell_size, _is_foreground, mode, _host_graphics_protocol)] =
             render_targets.as_slice()
         else {
             retained_fallback!("multiple_or_no_target");
@@ -4451,7 +4453,9 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
-        for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
+        for (client_id, (cols, rows), cell_size, is_foreground, mode, host_graphics_protocol) in
+            render_targets
+        {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
@@ -4550,27 +4554,49 @@ impl HeadlessServer {
             let mut reset_graphics = Vec::new();
             let mut encoded = if is_app_client
                 && self.app.state.kitty_graphics_enabled
+                && host_graphics_protocol.is_enabled()
                 && cell_size.is_known()
             {
-                if client.graphics_surface_reset_pending {
-                    if self.app.pane_graphics.slots.is_empty() {
-                        reset_graphics = next_graphics_cache.clear_bytes();
-                    } else {
-                        next_graphics_cache = crate::kitty_graphics::HostGraphicsCache::default();
+                if host_graphics_protocol.is_sixel() {
+                    next_graphics_cache = crate::kitty_graphics::HostGraphicsCache::default();
+                    let graphics_started = crate::render_prof::timer();
+                    let encoded = crate::kitty_graphics::encode_local_pane_graphics_sixel(
+                        &self.app.state,
+                        &self.app.pane_graphics,
+                        &self.app.terminal_runtimes,
+                        self.app.state.view.tab_surface(),
+                        cell_size,
+                    );
+                    crate::render_prof::duration_since(
+                        "full_render.graphics_encode",
+                        graphics_started,
+                    );
+                    encoded
+                } else {
+                    if client.graphics_surface_reset_pending {
+                        if self.app.pane_graphics.slots.is_empty() {
+                            reset_graphics = next_graphics_cache.clear_bytes();
+                        } else {
+                            next_graphics_cache =
+                                crate::kitty_graphics::HostGraphicsCache::default();
+                        }
                     }
+                    let graphics_started = crate::render_prof::timer();
+                    let encoded = crate::kitty_graphics::encode_local_pane_graphics(
+                        &self.app.state,
+                        &self.app.pane_graphics,
+                        &self.app.terminal_runtimes,
+                        self.app.state.view.tab_surface(),
+                        cell_size,
+                        Some(crate::kitty_graphics::HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
+                        &mut next_graphics_cache,
+                    );
+                    crate::render_prof::duration_since(
+                        "full_render.graphics_encode",
+                        graphics_started,
+                    );
+                    encoded
                 }
-                let graphics_started = crate::render_prof::timer();
-                let encoded = crate::kitty_graphics::encode_local_pane_graphics(
-                    &self.app.state,
-                    &self.app.pane_graphics,
-                    &self.app.terminal_runtimes,
-                    self.app.state.view.tab_surface(),
-                    cell_size,
-                    Some(crate::kitty_graphics::HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
-                    &mut next_graphics_cache,
-                );
-                crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);
-                encoded
             } else if self.app.pane_graphics.slots.is_empty() {
                 crate::kitty_graphics::EncodedGraphics {
                     bytes: next_graphics_cache.clear_bytes(),
@@ -6174,6 +6200,7 @@ mod tests {
             cell_width_px: 10,
             cell_height_px: 20,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: true,
@@ -6191,6 +6218,7 @@ mod tests {
             cell_width_px: 10,
             cell_height_px: 20,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6221,6 +6249,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6246,6 +6275,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6287,6 +6317,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6301,6 +6332,7 @@ new_tab = "prefix+t"
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6345,6 +6377,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6421,6 +6454,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6442,6 +6476,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6477,6 +6512,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Disabled,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -6543,6 +6579,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Disabled,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -6957,6 +6994,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -6992,6 +7030,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Disabled,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -7026,6 +7065,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::SemanticFrame,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Kitty,
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
@@ -7127,6 +7167,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Disabled,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -9152,6 +9193,7 @@ next_tab = ""
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
+            host_graphics_protocol: crate::protocol::HostGraphicsProtocol::Disabled,
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
@@ -9804,6 +9846,7 @@ next_tab = ""
                 None,
                 2,
                 RenderEncoding::SemanticFrame,
+                crate::protocol::HostGraphicsProtocol::Disabled,
                 false,
                 Some(client_tx),
             ),

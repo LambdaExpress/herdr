@@ -470,9 +470,13 @@ impl HeadlessServer {
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
         let mut app_view_size = None;
-        for (_, terminal_size, _, _, mode) in &render_targets {
+        for (_, terminal_size, _, _, mode, host_graphics_protocol) in &render_targets {
             if !matches!(mode, ClientConnectionMode::App) {
                 continue;
+            }
+            if host_graphics_protocol.is_sixel() {
+                crate::render_prof::event("retained_graphics_fallback.sixel_full_repaint");
+                return RetainedGraphicsOutcome::Fallback;
             }
             if app_view_size.is_some_and(|size| size != *terminal_size) {
                 crate::render_prof::event("retained_graphics_fallback.mixed_app_geometry");
@@ -483,7 +487,9 @@ impl HeadlessServer {
         let mut deferred = false;
         let mut prepared = Vec::new();
 
-        for (client_id, (cols, rows), cell_size, _is_foreground, mode) in render_targets {
+        for (client_id, (cols, rows), cell_size, _is_foreground, mode, _host_graphics_protocol) in
+            render_targets
+        {
             if !matches!(mode, ClientConnectionMode::App) {
                 continue;
             }

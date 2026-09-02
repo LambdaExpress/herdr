@@ -60,7 +60,7 @@ struct ClientLoopConfig {
     mouse_scroll_lines: usize,
     redraw_on_focus_gained: bool,
     host_cursor: crate::config::HostCursorModeConfig,
-    kitty_graphics_enabled: bool,
+    host_graphics_protocol: crate::protocol::HostGraphicsProtocol,
     mouse_capture_active: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 }
@@ -77,8 +77,8 @@ struct ClientState {
     reported_size: (u16, u16),
     /// Client-local sound playback config, refreshed on server request.
     sound_config: crate::config::SoundConfig,
-    /// Whether this client may write Kitty graphics bytes to its host terminal.
-    kitty_graphics_enabled: bool,
+    /// Graphics protocol accepted by this client's host terminal.
+    host_graphics_protocol: crate::protocol::HostGraphicsProtocol,
     /// One bounded matcher, inactive unless a direct transmission is armed.
     #[cfg(unix)]
     direct_graphics_response: Arc<Mutex<direct_graphics::ResponseMatcher>>,
@@ -771,6 +771,12 @@ fn requested_keybindings() -> ClientKeybindings {
     }
 }
 
+fn requested_host_graphics_protocol(
+    kitty_graphics_enabled: bool,
+) -> crate::protocol::HostGraphicsProtocol {
+    crate::kitty_graphics::host_graphics_protocol(kitty_graphics_enabled)
+}
+
 #[cfg(windows)]
 fn set_handshake_recv_timeout(
     stream: &LocalStream,
@@ -829,6 +835,7 @@ fn do_handshake(
     cell_height_px: u32,
     exact_cell_size: bool,
     requested_encoding: RenderEncoding,
+    host_graphics_protocol: crate::protocol::HostGraphicsProtocol,
     direct_attach_requested: bool,
 ) -> Result<RenderEncoding, ClientError> {
     stream
@@ -843,6 +850,7 @@ fn do_handshake(
         cell_width_px,
         cell_height_px,
         requested_encoding,
+        host_graphics_protocol,
         keybindings: requested_keybindings(),
         launch_mode: client_launch_mode(
             direct_attach_requested,
@@ -1029,6 +1037,7 @@ fn connect_terminal_session_stream(
         0,
         false,
         RenderEncoding::TerminalAnsi,
+        crate::protocol::HostGraphicsProtocol::Disabled,
         true,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
@@ -1220,14 +1229,15 @@ fn run_client_with_mode(
     let host_cursor = loaded_config.config.ui.host_cursor;
     let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
-    let kitty_graphics_enabled =
-        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+    let host_graphics_protocol = requested_host_graphics_protocol(
+        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested,
+    );
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
         redraw_on_focus_gained,
         host_cursor,
-        kitty_graphics_enabled,
+        host_graphics_protocol,
         mouse_capture_active: mouse_capture,
         remote_image_paste_key,
     };
@@ -1249,7 +1259,7 @@ fn run_client_with_mode(
 
     // Get the terminal geometry before handshake (before raw mode).
     let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
-        initial_terminal_geometry(kitty_graphics_enabled);
+        initial_terminal_geometry(host_graphics_protocol.is_enabled());
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
@@ -1260,6 +1270,7 @@ fn run_client_with_mode(
         cell_height_px,
         exact_cell_size,
         requested_encoding,
+        host_graphics_protocol,
         direct_attach_requested,
     ) {
         Ok(encoding) => encoding,
@@ -1398,7 +1409,7 @@ async fn run_client_loop(
         keyboard_report_all_active: false,
         reported_size: (cols, rows),
         sound_config: config.sound_config,
-        kitty_graphics_enabled: config.kitty_graphics_enabled,
+        host_graphics_protocol: config.host_graphics_protocol,
         #[cfg(unix)]
         direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
         #[cfg(unix)]
@@ -1427,7 +1438,7 @@ async fn run_client_loop(
     // Terminals behind ConPTY report no pixel size through the ioctl, so ask the
     // host terminal directly instead of falling back to an assumed cell size.
     let will_query_host_cell_size = state.attach_escape.is_none()
-        && host_cell_size_query_required(state.kitty_graphics_enabled);
+        && host_cell_size_query_required(state.host_graphics_protocol.is_enabled());
     let stdin_quit = should_quit.clone();
     let stdin_tx = event_tx.clone();
     let stdin_mouse_capture_active = host_mouse_capture_active.clone();
@@ -1466,7 +1477,7 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     let resize_cell_size = reported_cell_size.clone();
-    let kitty_graphics_enabled = state.kitty_graphics_enabled;
+    let host_graphics_enabled = state.host_graphics_protocol.is_enabled();
     std::thread::spawn(move || {
         resize_poll_loop(
             resize_tx,
@@ -1474,7 +1485,7 @@ async fn run_client_loop(
             rows,
             initial_cell_width_px,
             initial_cell_height_px,
-            kitty_graphics_enabled,
+            host_graphics_enabled,
             &resize_cell_size,
             &resize_quit,
         );
@@ -1486,7 +1497,7 @@ async fn run_client_loop(
     let server_read_tx = event_tx.clone();
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
     std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
+        let max_frame_size = if host_graphics_enabled {
             MAX_GRAPHICS_FRAME_SIZE
         } else {
             MAX_FRAME_SIZE
@@ -1689,19 +1700,23 @@ async fn run_client_loop(
                             .encode(&frame_data, state.repaint_pending)
                     };
                     let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
+                    let graphics = if state.host_graphics_protocol.is_enabled() {
                         frame_data.graphics.as_slice()
                     } else {
                         &[]
                     };
+                    let sixel_repaint =
+                        host_graphics_requires_repaint(state.host_graphics_protocol, graphics);
                     let _ =
                         write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
                     let _ = stdout.flush();
                     state.blit_encoder.commit(frame_data, encoded);
-                    state.repaint_pending = false;
+                    state.repaint_pending = sixel_repaint;
                 }
                 ServerMessage::Terminal(frame) => {
-                    if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
+                    if state.host_graphics_protocol.is_kitty()
+                        && contains_kitty_graphics_bytes(&frame.bytes)
+                    {
                         record_received_kitty_graphics(&frame.bytes);
                     }
                     let mut stdout = io::stdout();
@@ -1709,7 +1724,7 @@ async fn run_client_loop(
                     let _ = stdout.flush();
                 }
                 ServerMessage::Graphics { bytes } => {
-                    if state.kitty_graphics_enabled {
+                    if state.host_graphics_protocol.is_kitty() {
                         record_received_kitty_graphics(&bytes);
                         let mut stdout = io::stdout();
                         let _ = stdout.write_all(&bytes);
@@ -1736,7 +1751,7 @@ async fn run_client_loop(
                         if state.retired_direct_graphics.take() == Some((transfer_id, image_id)) {
                             continue;
                         }
-                        let valid = state.kitty_graphics_enabled
+                        let valid = state.host_graphics_protocol.is_kitty()
                             && usize::try_from(expected_len).ok().is_some_and(|len| {
                                 crate::pane_graphics_files::validate_direct_source(
                                     std::path::Path::new(&path),
@@ -2347,6 +2362,13 @@ fn write_encoded_frame_with_graphics(
     writer.write_all(graphics)?;
     writer.write_all(b"\x1b8")?;
     writer.write_all(&encoded[insertion..])
+}
+
+fn host_graphics_requires_repaint(
+    protocol: crate::protocol::HostGraphicsProtocol,
+    graphics: &[u8],
+) -> bool {
+    protocol.is_sixel() && !graphics.is_empty()
 }
 
 fn contains_kitty_graphics_bytes(bytes: &[u8]) -> bool {
@@ -2962,6 +2984,22 @@ mod tests {
         write_encoded_frame_with_graphics(&mut output, b"text", b"").unwrap();
 
         assert_eq!(output, b"text");
+    }
+
+    #[test]
+    fn sixel_graphics_force_the_next_text_frame_to_clear_stale_pixels() {
+        assert!(host_graphics_requires_repaint(
+            crate::protocol::HostGraphicsProtocol::Sixel,
+            b"sixel"
+        ));
+        assert!(!host_graphics_requires_repaint(
+            crate::protocol::HostGraphicsProtocol::Sixel,
+            b""
+        ));
+        assert!(!host_graphics_requires_repaint(
+            crate::protocol::HostGraphicsProtocol::Kitty,
+            b"kitty"
+        ));
     }
 
     #[test]

@@ -1871,7 +1871,7 @@ impl AppState {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
-            prompt_new_tab_name: true,
+            prompt_new_tab_name: false,
             prompt_new_workspace_name: false,
             pane_borders: true,
             pane_outer_borders: true,

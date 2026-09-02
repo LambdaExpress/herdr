@@ -709,7 +709,7 @@
         {
           "key": "ui.prompt_new_tab_name",
           "type": "boolean",
-          "default": "true",
+          "default": "false",
           "description": "Ask for a tab name before creating a new tab."
         },
         {

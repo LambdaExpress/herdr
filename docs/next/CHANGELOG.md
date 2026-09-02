@@ -25,6 +25,7 @@
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
 
 ### Changed
+- New tabs now open immediately with generated numeric labels by default. Set `ui.prompt_new_tab_name = true` to restore the naming prompt.
 - Windows support is now generally available through stable releases and uses the stable update channel by default. Existing preview installs stay on preview until explicitly switched.
 - Headless servers now use a configurable 120×40 virtual terminal instead of 80×24 when no client is attached, giving newly created panes a practical default size. (#2828)
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding. (#2570, thanks @dhh)

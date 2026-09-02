@@ -4591,6 +4591,7 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
+        app.state.prompt_new_tab_name = true;
 
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 44, 20));
         let switch = app.state.view.mobile_menu_hit_area;
@@ -4611,7 +4612,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_switcher_new_tab_skips_dialog_when_prompt_disabled() {
+    fn mobile_switcher_new_tab_creates_immediately_by_default() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("one");
         ws.test_add_tab(Some("logs"));
@@ -4619,7 +4620,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.prompt_new_tab_name = false;
 
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 44, 20));
         let switch = app.state.view.mobile_menu_hit_area;
@@ -4642,13 +4642,12 @@ mod tests {
     }
 
     #[test]
-    fn desktop_new_tab_button_skips_dialog_when_prompt_disabled() {
+    fn desktop_new_tab_button_creates_immediately_by_default() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.prompt_new_tab_name = false;
 
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
         let new_tab_area = app.state.view.new_tab_hit_area;

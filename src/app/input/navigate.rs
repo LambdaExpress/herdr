@@ -3759,8 +3759,9 @@ navigate_pane_down = "ctrl+j"
     }
 
     #[test]
-    fn new_tab_action_opens_dialog_without_creating_tab() {
+    fn new_tab_action_can_open_dialog_when_enabled() {
         let mut state = state_with_workspaces(&["test"]);
+        state.prompt_new_tab_name = true;
 
         execute_navigate_action(&mut state, NavigateAction::NewTab);
 
@@ -3773,9 +3774,8 @@ navigate_pane_down = "ctrl+j"
     }
 
     #[test]
-    fn new_tab_action_can_skip_rename_dialog() {
+    fn new_tab_action_creates_immediately_by_default() {
         let mut state = state_with_workspaces(&["test"]);
-        state.prompt_new_tab_name = false;
 
         execute_navigate_action(&mut state, NavigateAction::NewTab);
 

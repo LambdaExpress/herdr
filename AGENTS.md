@@ -156,6 +156,12 @@ env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH cargo run -- <command>
 - Targeted Windows unit tests MUST use `cargo test --locked --target
   x86_64-pc-windows-msvc --bin herdr <filter>`. Unbounded `cargo nextest run`
   attempts to compile Unix-only integration tests on Windows.
+- If Cargo cannot replace an in-use checkout build such as
+  `target/x86_64-pc-windows-msvc/debug/herdr.exe`, rename the occupied
+  executable with a timestamped `.previous` suffix, then rebuild into the
+  original target directory. Do not work around the lock with an alternate or
+  temporary target directory. Keep the renamed executable until its process
+  has exited.
 - Replacing an in-use installed `herdr.exe` MUST rename the existing binary
   first, then copy the new binary to the original path. NEVER overwrite the
   running binary in place. Resolve the installed path instead of assuming it:

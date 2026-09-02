@@ -22,6 +22,12 @@ const KITTY_CHUNK_BYTES: usize = 3072;
 pub(crate) const HEADLESS_GRAPHICS_TRANSACTION_BUDGET: usize =
     crate::protocol::MAX_GRAPHICS_FRAME_SIZE - crate::protocol::MAX_FRAME_SIZE;
 const HOST_IMAGE_ID_BASE: u32 = 10_000;
+// Windows Terminal implements VT340 SIXEL with a fixed virtual cell size,
+// independent of the configured font's rendered cell size.
+const SIXEL_CELL_SIZE: HostCellSize = HostCellSize {
+    width_px: 10,
+    height_px: 20,
+};
 #[cfg(test)]
 const PANE_GRAPHICS_IMAGE_ID_BIT: u32 = 1 << 31;
 
@@ -199,7 +205,6 @@ pub(crate) fn paint_local_pane_graphics(
             graphics,
             terminal_runtimes,
             app.view.tab_surface(),
-            cell_size,
         );
         if encoded.bytes.is_empty() {
             return Ok(());
@@ -333,9 +338,8 @@ pub(crate) fn encode_local_pane_graphics_sixel(
     graphics: &crate::app::pane_graphics::Runtime,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
-    cell_size: HostCellSize,
 ) -> EncodedGraphics {
-    if app.mode != Mode::Terminal || !cell_size.is_known() {
+    if app.mode != Mode::Terminal {
         return EncodedGraphics {
             bytes: Vec::new(),
             incomplete: false,
@@ -347,7 +351,7 @@ pub(crate) fn encode_local_pane_graphics_sixel(
         graphics,
         terminal_runtimes,
         surface,
-        cell_size,
+        SIXEL_CELL_SIZE,
         &HashMap::new(),
     );
     placements.sort_by_key(|placement| (placement.placement.z, placement.area.y, placement.area.x));
@@ -384,20 +388,13 @@ fn encode_sixel_placement(placement: &HostPlacement) -> Option<Vec<u8>> {
     if raw_width == 0 || raw_height == 0 {
         return None;
     }
-    let target_height = (raw_height / 6).max(1).checked_mul(6)?;
-    let target_width = ((u64::from(raw_width) * u64::from(target_height)
-        + u64::from(raw_height) / 2)
-        / u64::from(raw_height))
-    .max(1)
-    .min(u64::from(u32::MAX)) as u32;
-    let x_offset = ((u64::from(clipped.x_offset) * u64::from(target_height)
-        + u64::from(raw_height) / 2)
-        / u64::from(raw_height))
-    .min(u64::from(target_width)) as u32;
-    let y_offset = ((u64::from(clipped.y_offset) * u64::from(target_height)
-        + u64::from(raw_height) / 2)
-        / u64::from(raw_height))
-    .min(u64::from(target_height)) as u32;
+    // The encoder pads the final partial sixel band with transparent pixels.
+    // Preserve the full virtual-cell height; rounding down to a multiple of six
+    // leaves an unpainted horizontal gap in every terminal row.
+    let target_width = raw_width;
+    let target_height = raw_height;
+    let x_offset = clipped.x_offset.min(target_width);
+    let y_offset = clipped.y_offset.min(target_height);
     let rgba = crop_scale_rgba(
         &source,
         clipped,

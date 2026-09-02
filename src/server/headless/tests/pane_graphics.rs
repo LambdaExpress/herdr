@@ -54,9 +54,11 @@ async fn windows_terminal_client_receives_sixel_instead_of_kitty_commands() {
     let (mut server, client_rx, pane_id) = retained_test_server(b"SIXEL");
     server.app.state.kitty_graphics_enabled = true;
     let client = server.clients.get_mut(&1).unwrap();
+    // Crossterm cannot report Windows pixel geometry, so this is the generic
+    // fallback the client previously sent instead of the SIXEL virtual grid.
     client.cell_size = crate::kitty_graphics::HostCellSize {
-        width_px: 10,
-        height_px: 20,
+        width_px: 8,
+        height_px: 16,
     };
     client.host_graphics_protocol = crate::protocol::HostGraphicsProtocol::Sixel;
 
@@ -84,6 +86,10 @@ async fn windows_terminal_client_receives_sixel_instead_of_kitty_commands() {
 
     assert!(frame.graphics.windows(2).any(|bytes| bytes == b"\x1bP"));
     assert!(!frame.graphics.windows(3).any(|bytes| bytes == b"\x1b_G"));
+    assert!(frame
+        .graphics
+        .windows(b"\"1;1;20;20".len())
+        .any(|bytes| bytes == b"\"1;1;20;20"));
 }
 
 fn enable_graphics_and_render(

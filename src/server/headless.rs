@@ -4565,7 +4565,6 @@ impl HeadlessServer {
                         &self.app.pane_graphics,
                         &self.app.terminal_runtimes,
                         self.app.state.view.tab_surface(),
-                        cell_size,
                     );
                     crate::render_prof::duration_since(
                         "full_render.graphics_encode",

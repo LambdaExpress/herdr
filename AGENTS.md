@@ -140,6 +140,37 @@ server:
 env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH cargo run -- <command>
 ```
 
+### Windows local validation and binary replacement
+
+- On Windows workstations with `D:\tools`, manually provisioned CLI tools and
+  shared caches MUST live there. NEVER create ad hoc tool directories in the
+  checkout or user profile.
+- If `just` is unavailable, use `scripts/windows_check.ps1 -Mode lint` or
+  `scripts/windows_check.ps1 -Mode check` for the equivalent project checks.
+- When the checkout and Zig global cache use different drive letters, set
+  `$env:ZIG = 'D:\tools\zig-0.15.2\zig.exe'` and
+  `$env:ZIG_GLOBAL_CACHE_DIR = 'D:\tools\zig-cache-0.15.2'` before Cargo on
+  this workstation. Zig 0.15.2 can otherwise assert in
+  `std.Build.Step.Run.convertPathArg` while resolving a build-time executable
+  across drives.
+- Targeted Windows unit tests MUST use `cargo test --locked --target
+  x86_64-pc-windows-msvc --bin herdr <filter>`. Unbounded `cargo nextest run`
+  attempts to compile Unix-only integration tests on Windows.
+- Replacing an in-use installed `herdr.exe` MUST rename the existing binary
+  first, then copy the new binary to the original path. NEVER overwrite the
+  running binary in place. Resolve the installed path instead of assuming it:
+
+```powershell
+$installed = (Get-Command herdr).Source
+$backup = "$installed.$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss')).previous"
+Move-Item -LiteralPath $installed -Destination $backup
+Copy-Item -LiteralPath $newBinary -Destination $installed
+& $installed --version
+```
+
+Keep the renamed binary until the new executable is verified and the old
+Herdr process has exited.
+
 ## Local Can Machine Workflow
 
 This section applies only on Can's workstation or Windows VM setup when the

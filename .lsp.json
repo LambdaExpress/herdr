@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "rust-analyzer": {
+      "command": "rust-analyzer",
+      "args": [],
+      "fileTypes": [".rs"],
+      "rootMarkers": ["rust-toolchain.toml", "Cargo.toml", ".git"]
+    }
+  }
+}

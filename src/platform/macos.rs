@@ -547,8 +547,8 @@ fn spawn_macos_open(target: &OsStr) -> std::io::Result<Option<std::process::Chil
         .map(Some)
 }
 
-pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
-    spawn_macos_open(OsStr::new(url))
+pub fn open_target(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
+    spawn_macos_open(target)
 }
 
 pub fn open_in_file_manager(path: &Path) -> std::io::Result<Option<std::process::Child>> {

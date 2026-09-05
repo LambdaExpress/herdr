@@ -490,8 +490,8 @@ fn spawn_xdg_open(target: &std::ffi::OsStr) -> std::io::Result<Option<std::proce
         .map(Some)
 }
 
-pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
-    spawn_xdg_open(std::ffi::OsStr::new(url))
+pub fn open_target(target: &std::ffi::OsStr) -> std::io::Result<Option<std::process::Child>> {
+    spawn_xdg_open(target)
 }
 
 pub fn open_in_file_manager(

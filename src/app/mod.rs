@@ -128,7 +128,7 @@ pub struct App {
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
-    pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
+    pub(crate) pending_open_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
@@ -763,7 +763,7 @@ impl App {
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
             last_pane_click: None,
-            pending_url_click_sources: HashSet::new(),
+            pending_open_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
@@ -1875,7 +1875,7 @@ impl App {
         // click has to outlive a plain focus change, because opening the URL
         // raises the browser and costs the host terminal its focus before the
         // mouse release arrives.
-        self.pending_url_click_sources.remove(&source_id);
+        self.pending_open_click_sources.remove(&source_id);
         self.release_input_source_headless(source_id);
     }
 

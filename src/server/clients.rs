@@ -58,6 +58,8 @@ pub(crate) struct ClientConnection {
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// Client-local cache of encoded SIXEL image payloads.
+    pub(crate) sixel_graphics_cache: crate::kitty_graphics::SixelGraphicsCache,
     /// Graphics protocol accepted by the client's outer terminal.
     pub(crate) host_graphics_protocol: crate::protocol::HostGraphicsProtocol,
     /// Passive eligibility for audited local Kitty regular-file graphics.
@@ -136,6 +138,7 @@ impl ClientConnection {
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+            sixel_graphics_cache: crate::kitty_graphics::SixelGraphicsCache::default(),
             host_graphics_protocol,
             direct_graphics: false,
             pixel_mouse: false,

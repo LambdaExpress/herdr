@@ -26,14 +26,14 @@ enum WheelRouting {
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
 const TAB_DRAG_THRESHOLD: u16 = 1;
 
-fn modified_url_click_modifier() -> KeyModifiers {
+fn modified_link_click_modifier() -> KeyModifiers {
     KeyModifiers::CONTROL
 }
 
 #[cfg(test)]
 #[test]
-fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
-    assert_eq!(modified_url_click_modifier(), KeyModifiers::CONTROL);
+fn modified_link_click_modifier_matches_terminal_mouse_reporting() {
+    assert_eq!(modified_link_click_modifier(), KeyModifiers::CONTROL);
 }
 
 mod clipboard;
@@ -337,15 +337,15 @@ impl App {
     ) {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.pending_url_click_sources.remove(&source_id);
+                self.pending_open_click_sources.remove(&source_id);
             }
             MouseEventKind::Drag(MouseButton::Left)
-                if self.pending_url_click_sources.contains(&source_id) =>
+                if self.pending_open_click_sources.contains(&source_id) =>
             {
                 return;
             }
             MouseEventKind::Up(MouseButton::Left)
-                if self.pending_url_click_sources.remove(&source_id) =>
+                if self.pending_open_click_sources.remove(&source_id) =>
             {
                 return;
             }
@@ -380,7 +380,7 @@ impl App {
             }
         }
 
-        if self.handle_modified_url_click(source_id, mouse) {
+        if self.handle_modified_link_click(source_id, mouse) {
             return;
         }
 
@@ -562,23 +562,23 @@ impl App {
         self.focus_pane_internal_via_api(ws_idx, pane_id);
     }
 
-    fn handle_modified_url_click(
+    fn handle_modified_link_click(
         &mut self,
         source_id: super::InputSourceId,
         mouse: MouseEvent,
     ) -> bool {
-        self.handle_modified_url_click_with(source_id, mouse, crate::platform::open_url)
+        self.handle_modified_link_click_with(source_id, mouse, crate::platform::open_target)
     }
 
-    fn handle_modified_url_click_with(
+    fn handle_modified_link_click_with(
         &mut self,
         source_id: super::InputSourceId,
         mouse: MouseEvent,
-        open_url: impl FnOnce(&str) -> std::io::Result<Option<std::process::Child>>,
+        open_target: impl FnOnce(&std::ffi::OsStr) -> std::io::Result<Option<std::process::Child>>,
     ) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            || !mouse.modifiers.contains(modified_url_click_modifier())
+            || !mouse.modifiers.contains(modified_link_click_modifier())
         {
             return false;
         }
@@ -588,27 +588,35 @@ impl App {
         };
         let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
         let col = mouse.column.saturating_sub(info.inner_rect.x);
-        let Some(url) =
-            self.state
-                .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
-        else {
+        let Some(target) = self.state.open_target_at_pane_cell(
+            &self.terminal_runtimes,
+            info.id,
+            viewport_row,
+            col,
+        ) else {
             return false;
         };
 
         self.last_pane_click = None;
-        self.pending_url_click_sources.insert(source_id);
-        match self.invoke_plugin_link_handler_for_url(&url, info.id) {
-            Ok(true) => return true,
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+        self.pending_open_click_sources.insert(source_id);
+        if let Some(url) = target.web_url() {
+            match self.invoke_plugin_link_handler_for_url(url, info.id) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+                }
             }
         }
-        match open_url(&url) {
+        match open_target(target.as_os_str()) {
             Ok(Some(child)) => self.detached_process_children.push(child),
             Ok(None) => {}
             Err(err) => {
-                tracing::warn!(err = %err, url = %url, "failed to open pane URL");
+                tracing::warn!(
+                    err = %err,
+                    target = %target.as_os_str().to_string_lossy(),
+                    "failed to open pane link target"
+                );
             }
         }
         true

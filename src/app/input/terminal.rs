@@ -406,9 +406,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::super::wait_for_detached_process_reap;
-    use super::super::{app_for_mouse_test, mouse, numbered_lines_bytes};
     #[cfg(unix)]
-    use super::super::{unique_temp_path, wait_for_file};
+    use super::super::wait_for_file;
+    use super::super::{
+        app_for_mouse_test, modified_link_click_modifier, mouse, numbered_lines_bytes,
+        unique_temp_path,
+    };
     use super::*;
     use crate::{config::Config, events::AppEvent, workspace::Workspace};
 
@@ -880,6 +883,39 @@ mod tests {
         assert!(app.selection_highlight_clear_deadline.is_none());
     }
 
+    #[tokio::test]
+    async fn modified_click_opens_existing_local_file_from_pane_cwd() {
+        let root = unique_temp_path("local-link-target");
+        let image = root.join("sample image.png");
+        std::fs::create_dir_all(&root).expect("create link target directory");
+        std::fs::write(&image, b"image").expect("create link target file");
+
+        let line = r#"open "sample image.png""#;
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        app.state.workspaces[0].identity_cwd = root.clone();
+        let col = info.inner_rect.x + line.find("sample").expect("file name") as u16;
+        let mut opened = None;
+        let handled = app.handle_modified_link_click_with(
+            41,
+            modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                info.inner_rect.y,
+                modified_link_click_modifier(),
+            ),
+            |target| {
+                opened = Some(target.to_os_string());
+                Ok(None)
+            },
+        );
+
+        assert!(handled);
+        assert_eq!(opened.map(std::path::PathBuf::from), Some(image));
+        assert!(app.pending_open_click_sources.contains(&41));
+
+        std::fs::remove_dir_all(root).expect("remove link target directory");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ctrl_click_url_reaps_failed_opener() {
@@ -897,7 +933,7 @@ mod tests {
         let line = format!("see {url}");
         let (mut app, info) = app_with_screen_bytes(line.as_bytes());
         let col = info.inner_rect.x + line.find("example").expect("url host") as u16;
-        let handled = app.handle_modified_url_click_with(
+        let handled = app.handle_modified_link_click_with(
             41,
             modified_mouse(
                 MouseEventKind::Down(MouseButton::Left),

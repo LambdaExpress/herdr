@@ -1,7 +1,10 @@
 //! Pure state mutations on AppState.
 //! These don't need channels, async, or PTY runtime.
 
-use std::time::Instant;
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use tracing::{info, warn};
 
@@ -21,6 +24,28 @@ use super::state::{
     NavigatorStateFilter, NavigatorTarget, PaneFocusTarget, PendingAgentNotification, ToastKind,
     ToastNotification, ToastTarget, ViewLayout,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneOpenTarget {
+    WebUrl(String),
+    LocalPath(PathBuf),
+}
+
+impl PaneOpenTarget {
+    pub(crate) fn as_os_str(&self) -> &std::ffi::OsStr {
+        match self {
+            Self::WebUrl(url) => std::ffi::OsStr::new(url),
+            Self::LocalPath(path) => path.as_os_str(),
+        }
+    }
+
+    pub(crate) fn web_url(&self) -> Option<&str> {
+        match self {
+            Self::WebUrl(url) => Some(url),
+            Self::LocalPath(_) => None,
+        }
+    }
+}
 
 fn is_background_completion_transition(prev_state: AgentState, new_state: AgentState) -> bool {
     matches!(new_state, AgentState::Idle)
@@ -2222,13 +2247,13 @@ impl AppState {
         true
     }
 
-    pub(crate) fn url_at_pane_cell(
+    pub(crate) fn open_target_at_pane_cell(
         &self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
         viewport_row: u16,
         col: u16,
-    ) -> Option<String> {
+    ) -> Option<PaneOpenTarget> {
         let ws_idx = self
             .active
             .filter(|idx| self.workspaces.get(*idx).is_some())?;
@@ -2238,6 +2263,10 @@ impl AppState {
         }
 
         let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
+        let cwd = self.workspaces[ws_idx]
+            .active_tab()
+            .and_then(|tab| tab.cwd_for_pane(pane_id, &self.terminals, terminal_runtimes))
+            .or_else(|| Some(self.workspaces[ws_idx].identity_cwd.clone()));
         let screen_col = info.inner_rect.x.saturating_add(col);
         let screen_row = info.inner_rect.y.saturating_add(viewport_row);
         if let Some((_, _, uri)) = rt
@@ -2245,7 +2274,12 @@ impl AppState {
             .into_iter()
             .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
         {
-            return safe_web_url(&uri).map(str::to_owned);
+            if let Some(url) = safe_web_url(&uri) {
+                return Some(PaneOpenTarget::WebUrl(url.to_owned()));
+            }
+            if let Some(path) = existing_local_path(&uri, cwd.as_deref()) {
+                return Some(PaneOpenTarget::LocalPath(path));
+            }
         }
 
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
@@ -2265,7 +2299,25 @@ impl AppState {
             .find('\n')
             .map_or(visible_text.len(), |idx| logical_cell.byte_index + idx);
         let line = visible_text.get(line_start..line_end)?;
-        url_at_column(line, logical_cell.logical_col).map(str::to_owned)
+        if let Some(url) = url_at_column(line, logical_cell.logical_col) {
+            return Some(PaneOpenTarget::WebUrl(url.to_owned()));
+        }
+        path_at_column(line, logical_cell.logical_col, cwd.as_deref())
+            .map(PaneOpenTarget::LocalPath)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn url_at_pane_cell(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+    ) -> Option<String> {
+        match self.open_target_at_pane_cell(terminal_runtimes, pane_id, viewport_row, col)? {
+            PaneOpenTarget::WebUrl(url) => Some(url),
+            PaneOpenTarget::LocalPath(_) => None,
+        }
     }
 
     pub fn copy_selection(&mut self, terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry) {
@@ -2352,6 +2404,88 @@ pub(crate) fn url_at_column(row: &str, col: u16) -> Option<&str> {
     let start_byte = byte_index_for_cell(row, span.start);
     let end_byte = byte_index_after_cell(row, span.end);
     safe_web_url(row.get(start_byte..end_byte)?)
+}
+
+fn path_at_column(row: &str, col: u16, cwd: Option<&Path>) -> Option<PathBuf> {
+    let cells = text_cells(row);
+    let clicked_idx = cell_index_at_column(&cells, col)?;
+    let span = quoted_span_at_column(&cells, clicked_idx)
+        .or_else(|| token_span_at_column(&cells, clicked_idx))?;
+    let start_byte = byte_index_for_cell(row, span.start);
+    let end_byte = byte_index_after_cell(row, span.end);
+    existing_local_path(row.get(start_byte..end_byte)?, cwd)
+}
+
+fn existing_local_path(candidate: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let mut candidate = candidate;
+    for _ in 0..=2 {
+        let path = local_path_candidate(candidate)?;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd?.join(path)
+        };
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file() || metadata.is_dir()) {
+            return Some(path);
+        }
+
+        let (without_location, location) = candidate.rsplit_once(':')?;
+        if without_location.is_empty()
+            || location.is_empty()
+            || !location.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        candidate = without_location;
+    }
+    None
+}
+
+fn local_path_candidate(candidate: &str) -> Option<PathBuf> {
+    let Some(encoded_path) = candidate.strip_prefix("file://") else {
+        return Some(crate::worktree::expand_tilde_path(candidate));
+    };
+    let encoded_path = encoded_path
+        .strip_prefix("localhost")
+        .unwrap_or(encoded_path);
+    if !encoded_path.starts_with('/') {
+        return None;
+    }
+
+    let decoded_path = percent_decode_utf8(encoded_path)?;
+    let native_path = decoded_path
+        .strip_prefix('/')
+        .filter(|without_leading_slash| Path::new(without_leading_slash).is_absolute())
+        .unwrap_or(&decoded_path);
+    Some(PathBuf::from(native_path))
+}
+
+fn percent_decode_utf8(encoded: &str) -> Option<String> {
+    let encoded = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut idx = 0;
+    while idx < encoded.len() {
+        if encoded[idx] != b'%' {
+            decoded.push(encoded[idx]);
+            idx += 1;
+            continue;
+        }
+
+        let high = hex_digit(*encoded.get(idx + 1)?)?;
+        let low = hex_digit(*encoded.get(idx + 2)?)?;
+        decoded.push((high << 4) | low);
+        idx += 3;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn url_spans(cells: &[TextCell]) -> Vec<CellSpan> {
@@ -2575,6 +2709,14 @@ fn trailing_url_closer_is_balanced(
 }
 
 fn quoted_path_span_at_column(cells: &[TextCell], clicked_idx: usize) -> Option<CellSpan> {
+    let span = quoted_span_at_column(cells, clicked_idx)?;
+    cells[span.start..=span.end]
+        .iter()
+        .any(|cell| matches!(cell.ch, '/' | '\\'))
+        .then_some(span)
+}
+
+fn quoted_span_at_column(cells: &[TextCell], clicked_idx: usize) -> Option<CellSpan> {
     let clicked = cells.get(clicked_idx)?.ch;
     if clicked == '"' || clicked == '\'' || clicked == '`' {
         return None;
@@ -2588,10 +2730,7 @@ fn quoted_path_span_at_column(cells: &[TextCell], clicked_idx: usize) -> Option<
                 continue;
             }
             if let Some(open) = start {
-                if clicked_idx > open
-                    && clicked_idx < idx
-                    && cells[open + 1..idx].iter().any(|cell| cell.ch == '/')
-                {
+                if clicked_idx > open && clicked_idx < idx {
                     return Some(CellSpan {
                         start: open + 1,
                         end: idx - 1,
@@ -3656,6 +3795,84 @@ mod tests {
             None
         );
         assert_eq!(selected_url("open file:///tmp/report", "file"), None);
+    }
+
+    #[test]
+    fn path_at_column_resolves_files_directories_and_source_locations() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-link-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let assets = root.join("assets");
+        let image = assets.join("sample image.png");
+        std::fs::create_dir_all(&assets).expect("create link target directory");
+        std::fs::write(&image, b"image").expect("create link target file");
+
+        let relative_file = r#"open "assets/sample image.png:42:7""#;
+        assert_eq!(
+            path_at_column(relative_file, col_of(relative_file, "sample"), Some(&root)),
+            Some(image.clone())
+        );
+        let relative_directory = "browse assets";
+        assert_eq!(
+            path_at_column(
+                relative_directory,
+                col_of(relative_directory, "assets"),
+                Some(&root)
+            ),
+            Some(assets)
+        );
+
+        let absolute_file = format!(r#"open "{}""#, image.display());
+        assert_eq!(
+            path_at_column(&absolute_file, col_of(&absolute_file, "sample"), None),
+            Some(image.clone())
+        );
+        assert_eq!(
+            path_at_column(
+                "open missing.png",
+                col_of("open missing.png", "missing"),
+                Some(&root)
+            ),
+            None
+        );
+
+        std::fs::remove_dir_all(root).expect("remove link target directory");
+    }
+
+    #[test]
+    fn path_at_column_decodes_existing_file_uri() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-file-uri-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let image = root.join("sample image.png");
+        std::fs::create_dir_all(&root).expect("create file URI target directory");
+        std::fs::write(&image, b"image").expect("create file URI target");
+
+        let uri_path = image
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace(' ', "%20");
+        let uri = if uri_path.starts_with('/') {
+            format!("file://{uri_path}")
+        } else {
+            format!("file:///{uri_path}")
+        };
+        assert_eq!(
+            path_at_column(&uri, col_of(&uri, "sample"), None),
+            Some(image)
+        );
+
+        std::fs::remove_dir_all(root).expect("remove file URI target directory");
     }
 
     #[test]

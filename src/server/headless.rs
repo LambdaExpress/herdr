@@ -4600,6 +4600,7 @@ impl HeadlessServer {
                         &self.app.pane_graphics,
                         &self.app.terminal_runtimes,
                         self.app.state.view.tab_surface(),
+                        &mut client.sixel_graphics_cache,
                     );
                     crate::render_prof::duration_since(
                         "full_render.graphics_encode",
@@ -4607,6 +4608,7 @@ impl HeadlessServer {
                     );
                     encoded
                 } else {
+                    client.sixel_graphics_cache.clear();
                     if client.graphics_surface_reset_pending {
                         if self.app.pane_graphics.slots.is_empty() {
                             reset_graphics = next_graphics_cache.clear_bytes();
@@ -4632,11 +4634,13 @@ impl HeadlessServer {
                     encoded
                 }
             } else if self.app.pane_graphics.slots.is_empty() {
+                client.sixel_graphics_cache.clear();
                 crate::kitty_graphics::EncodedGraphics {
                     bytes: next_graphics_cache.clear_bytes(),
                     incomplete: false,
                 }
             } else {
+                client.sixel_graphics_cache.clear();
                 next_graphics_cache.clear_next()
             };
             if !reset_graphics.is_empty() {

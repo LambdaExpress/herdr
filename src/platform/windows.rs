@@ -1931,8 +1931,8 @@ fn shell_execute_open(target: &OsStr) -> std::io::Result<Option<std::process::Ch
     }
 }
 
-pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
-    shell_execute_open(OsStr::new(url))
+pub fn open_target(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
+    shell_execute_open(target)
 }
 
 fn file_manager_command(

@@ -1745,8 +1745,12 @@ async fn run_client_loop(
                     };
                     let sixel_repaint =
                         host_graphics_requires_repaint(state.host_graphics_protocol, graphics);
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+                    let _ = write_encoded_frame_with_graphics(
+                        &mut stdout,
+                        &encoded.bytes,
+                        graphics,
+                        state.host_graphics_protocol,
+                    );
                     let _ = stdout.flush();
                     state.blit_encoder.commit(frame_data, encoded);
                     state.repaint_pending = sixel_repaint;
@@ -1758,7 +1762,11 @@ async fn run_client_loop(
                         record_received_kitty_graphics(&frame.bytes);
                     }
                     let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&frame.bytes);
+                    let _ = crate::kitty_graphics::write_host_output(
+                        &mut stdout,
+                        state.host_graphics_protocol,
+                        &frame.bytes,
+                    );
                     let _ = stdout.flush();
                 }
                 ServerMessage::Graphics { bytes } => {
@@ -2391,6 +2399,7 @@ fn write_encoded_frame_with_graphics(
     mut writer: impl io::Write,
     encoded: &[u8],
     graphics: &[u8],
+    protocol: crate::protocol::HostGraphicsProtocol,
 ) -> io::Result<()> {
     if graphics.is_empty() {
         return writer.write_all(encoded);
@@ -2401,7 +2410,7 @@ fn write_encoded_frame_with_graphics(
     writer.write_all(&encoded[..insertion])?;
     record_received_kitty_graphics(graphics);
     writer.write_all(b"\x1b7")?;
-    writer.write_all(graphics)?;
+    crate::kitty_graphics::write_host_output(&mut writer, protocol, graphics)?;
     writer.write_all(b"\x1b8")?;
     writer.write_all(&encoded[insertion..])
 }
@@ -3011,6 +3020,7 @@ mod tests {
             &mut output,
             b"\x1b[?2026htext\x1b[?2026lcursor",
             b"graphics",
+            crate::protocol::HostGraphicsProtocol::Kitty,
         )
         .unwrap();
 
@@ -3023,7 +3033,13 @@ mod tests {
     #[test]
     fn empty_graphics_writes_only_blit_frame() {
         let mut output = Vec::new();
-        write_encoded_frame_with_graphics(&mut output, b"text", b"").unwrap();
+        write_encoded_frame_with_graphics(
+            &mut output,
+            b"text",
+            b"",
+            crate::protocol::HostGraphicsProtocol::Kitty,
+        )
+        .unwrap();
 
         assert_eq!(output, b"text");
     }

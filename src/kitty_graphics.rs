@@ -28,6 +28,9 @@ const SIXEL_CELL_SIZE: HostCellSize = HostCellSize {
     width_px: 10,
     height_px: 20,
 };
+// Bound each ConPTY write so Windows Terminal can make progress between
+// parser-lock acquisitions while consuming large SIXEL frames.
+const SIXEL_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 #[cfg(test)]
 const PANE_GRAPHICS_IMAGE_ID_BIT: u32 = 1 << 31;
 
@@ -85,6 +88,11 @@ struct HostPlacement {
     pane_id: PaneId,
     host_image_id: Option<u32>,
     area: Rect,
+    /// Exclusive bottom row available to positioned SIXEL output.
+    ///
+    /// Windows Terminal may scroll the host surface when the final SIXEL
+    /// segment reaches the last row. Kitty graphics do not need this limit.
+    sixel_safe_bottom: Option<u16>,
     cell_size: HostCellSize,
     source_key: HostSourceKey,
     placement: KittyImagePlacement,
@@ -97,6 +105,12 @@ enum HostSourceKey {
     PaneLayer { pane_id: PaneId, layer_id: String },
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct SixelPlacementKey {
+    source: HostSourceKey,
+    placement_id: u32,
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct ImageSignature {
     image_width: u32,
@@ -104,6 +118,36 @@ struct ImageSignature {
     format_code: u32,
     data_len: usize,
     data_fingerprint: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SixelPayloadSignature {
+    image: ImageSignature,
+    cols: u32,
+    rows: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    x_offset: u32,
+    y_offset: u32,
+}
+
+#[derive(Debug)]
+struct CachedSixelPayload {
+    signature: SixelPayloadSignature,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SixelGraphicsCache {
+    payloads: HashMap<SixelPlacementKey, CachedSixelPayload>,
+}
+
+impl SixelGraphicsCache {
+    pub(crate) fn clear(&mut self) {
+        self.payloads.clear();
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -151,6 +195,7 @@ pub(crate) struct HostGraphicsCache {
 
 static KITTY_GRAPHICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static LOCAL_HOST_GRAPHICS: OnceLock<Mutex<HostGraphicsCache>> = OnceLock::new();
+static LOCAL_SIXEL_GRAPHICS: OnceLock<Mutex<SixelGraphicsCache>> = OnceLock::new();
 
 pub(crate) fn set_enabled(enabled: bool) {
     KITTY_GRAPHICS_ENABLED.store(enabled, Ordering::Release);
@@ -199,19 +244,26 @@ pub(crate) fn paint_local_pane_graphics(
     terminal_runtimes: &TerminalRuntimeRegistry,
     cell_size: HostCellSize,
 ) -> io::Result<()> {
-    if host_graphics_protocol(true).is_sixel() {
+    let protocol = host_graphics_protocol(true);
+    if protocol.is_sixel() {
+        let cache = LOCAL_SIXEL_GRAPHICS.get_or_init(|| Mutex::new(SixelGraphicsCache::default()));
+        let Ok(mut cache) = cache.lock() else {
+            return Ok(());
+        };
         let encoded = encode_local_pane_graphics_sixel(
             app,
             graphics,
             terminal_runtimes,
             app.view.tab_surface(),
+            &mut cache,
         );
+        drop(cache);
         if encoded.bytes.is_empty() {
             return Ok(());
         }
         let mut stdout = io::stdout().lock();
         stdout.write_all(b"\x1b7")?;
-        stdout.write_all(&encoded.bytes)?;
+        write_host_output(&mut stdout, protocol, &encoded.bytes)?;
         stdout.write_all(b"\x1b8")?;
         return stdout.flush();
     }
@@ -262,6 +314,21 @@ pub(crate) fn paint_local_pane_graphics(
         }
     }
     stdout.flush()
+}
+
+pub(crate) fn write_host_output(
+    writer: &mut impl Write,
+    protocol: crate::protocol::HostGraphicsProtocol,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if protocol.is_sixel() {
+        for chunk in bytes.chunks(SIXEL_WRITE_CHUNK_BYTES) {
+            writer.write_all(chunk)?;
+        }
+        Ok(())
+    } else {
+        writer.write_all(bytes)
+    }
 }
 
 pub(crate) struct EncodedGraphics {
@@ -338,8 +405,10 @@ pub(crate) fn encode_local_pane_graphics_sixel(
     graphics: &crate::app::pane_graphics::Runtime,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
+    cache: &mut SixelGraphicsCache,
 ) -> EncodedGraphics {
     if app.mode != Mode::Terminal {
+        cache.clear();
         return EncodedGraphics {
             bytes: Vec::new(),
             incomplete: false,
@@ -357,11 +426,13 @@ pub(crate) fn encode_local_pane_graphics_sixel(
     placements.sort_by_key(|placement| (placement.placement.z, placement.area.y, placement.area.x));
 
     let mut bytes = Vec::new();
+    let mut live = HashSet::with_capacity(placements.len());
     for placement in &placements {
-        if let Some(encoded) = encode_sixel_placement(placement) {
-            bytes.extend(encoded);
+        if let Some(key) = append_cached_sixel_placement(&mut bytes, placement, cache) {
+            live.insert(key);
         }
     }
+    cache.payloads.retain(|key, _| live.contains(key));
     EncodedGraphics {
         bytes,
         incomplete: false,
@@ -374,8 +445,70 @@ struct DecodedRgba<'a> {
     data: Cow<'a, [u8]>,
 }
 
+#[cfg(test)]
 fn encode_sixel_placement(placement: &HostPlacement) -> Option<Vec<u8>> {
-    let (clipped, _) = clipped_placement(placement)?;
+    let (clipped, _) = clipped_sixel_placement(placement)?;
+    let payload = encode_sixel_payload(placement, clipped)?;
+    let mut encoded = Vec::with_capacity(payload.len() + 24);
+    append_sixel_cursor(&mut encoded, clipped);
+    encoded.extend_from_slice(&payload);
+    Some(encoded)
+}
+
+#[cfg(test)]
+fn encode_sixel_placement_cached(
+    placement: &HostPlacement,
+    cache: &mut SixelGraphicsCache,
+) -> Option<Vec<u8>> {
+    let mut encoded = Vec::new();
+    append_cached_sixel_placement(&mut encoded, placement, cache)?;
+    Some(encoded)
+}
+
+fn append_cached_sixel_placement(
+    encoded: &mut Vec<u8>,
+    placement: &HostPlacement,
+    cache: &mut SixelGraphicsCache,
+) -> Option<SixelPlacementKey> {
+    let (clipped, format_code) = clipped_sixel_placement(placement)?;
+    let key = SixelPlacementKey {
+        source: placement.source_key.clone(),
+        placement_id: placement.placement.placement_id,
+    };
+    let signature = SixelPayloadSignature {
+        image: image_signature(placement, format_code),
+        cols: clipped.cols,
+        rows: clipped.rows,
+        source_x: clipped.source_x,
+        source_y: clipped.source_y,
+        source_width: clipped.source_width,
+        source_height: clipped.source_height,
+        x_offset: clipped.x_offset,
+        y_offset: clipped.y_offset,
+    };
+    if cache
+        .payloads
+        .get(&key)
+        .is_none_or(|entry| entry.signature != signature)
+    {
+        let bytes = encode_sixel_payload(placement, clipped)?;
+        cache
+            .payloads
+            .insert(key.clone(), CachedSixelPayload { signature, bytes });
+    }
+
+    let payload = &cache.payloads.get(&key)?.bytes;
+    encoded.reserve(payload.len() + 24);
+    append_sixel_cursor(encoded, clipped);
+    encoded.extend_from_slice(payload);
+    Some(key)
+}
+
+fn append_sixel_cursor(encoded: &mut Vec<u8>, clipped: ClippedPlacement) {
+    let _ = write!(encoded, "\x1b[{};{}H", clipped.y + 1, clipped.x + 1);
+}
+
+fn encode_sixel_payload(placement: &HostPlacement, clipped: ClippedPlacement) -> Option<Vec<u8>> {
     let source = decode_placement_rgba(placement)?;
     let source_right = clipped.source_x.checked_add(clipped.source_width)?;
     let source_bottom = clipped.source_y.checked_add(clipped.source_height)?;
@@ -411,10 +544,7 @@ fn encode_sixel_placement(placement: &HostPlacement) -> Option<Vec<u8>> {
     )
     .ok()?;
 
-    let mut encoded = Vec::with_capacity(sixel.len() + 24);
-    let _ = write!(encoded, "\x1b[{};{}H", clipped.y + 1, clipped.x + 1);
-    encoded.extend_from_slice(sixel.as_bytes());
-    Some(encoded)
+    Some(sixel.into_bytes())
 }
 
 fn decode_placement_rgba(placement: &HostPlacement) -> Option<DecodedRgba<'_>> {
@@ -477,23 +607,73 @@ fn crop_scale_rgba(
     }
 
     let source_width = usize::try_from(source.width).ok()?;
-    for dest_y in 0..content_height {
-        let source_y = clipped.source_y
-            + ((u64::from(dest_y) * u64::from(clipped.source_height)) / u64::from(content_height))
-                as u32;
+    let downscale = clipped.source_width > content_width || clipped.source_height > content_height;
+    let sample_area = f64::from(clipped.source_width) * f64::from(clipped.source_height);
+    let mut x_samples = Vec::new();
+    let mut x_ranges = Vec::new();
+    if downscale {
+        // Horizontal coverage is shared by every row; compute it once per payload.
+        x_samples.reserve(clipped.source_width as usize + content_width as usize);
+        x_ranges.reserve(content_width as usize);
         for dest_x in 0..content_width {
+            let begin = u64::from(dest_x) * u64::from(clipped.source_width);
+            let end = begin + u64::from(clipped.source_width);
+            let start = x_samples.len();
+            for sx in begin / u64::from(content_width)..end.div_ceil(u64::from(content_width)) {
+                let weight = (end.min((sx + 1) * u64::from(content_width))
+                    - begin.max(sx * u64::from(content_width))) as f64;
+                x_samples.push(((clipped.source_x as usize + sx as usize) * 4, weight));
+            }
+            x_ranges.push(start..x_samples.len());
+        }
+    }
+    for dest_y in 0..content_height {
+        let y_begin = u64::from(dest_y) * u64::from(clipped.source_height);
+        let y_end = y_begin + u64::from(clipped.source_height);
+        let source_y = clipped.source_y + (y_begin / u64::from(content_height)) as u32;
+        for dest_x in 0..content_width {
+            let target_index = usize::try_from(dest_y + y_offset)
+                .ok()?
+                .checked_mul(usize::try_from(target_width).ok()?)?
+                .checked_add(usize::try_from(dest_x + x_offset).ok()?)?
+                .checked_mul(4)?;
+            if downscale {
+                // Integrate the source pixel footprint instead of dropping thin strokes.
+                // Integer boundaries retain fractional coverage at non-integral ratios.
+                // Weight RGB by alpha so transparent pixels cannot bleed into text edges.
+                let mut sum = [0.0; 4];
+                for sy in
+                    y_begin / u64::from(content_height)..y_end.div_ceil(u64::from(content_height))
+                {
+                    let y_weight = (y_end.min((sy + 1) * u64::from(content_height))
+                        - y_begin.max(sy * u64::from(content_height)))
+                        as f64;
+                    let row_start = (clipped.source_y as usize + sy as usize) * source_width * 4;
+                    for &(offset, x_weight) in &x_samples[x_ranges[dest_x as usize].clone()] {
+                        let index = row_start + offset;
+                        let pixel = &source.data[index..index + 4];
+                        let alpha_weight = x_weight * y_weight * f64::from(pixel[3]);
+                        for channel in 0..3 {
+                            sum[channel] += f64::from(pixel[channel]) * alpha_weight;
+                        }
+                        sum[3] += alpha_weight;
+                    }
+                }
+                if sum[3] > 0.0 {
+                    for channel in 0..3 {
+                        target[target_index + channel] = (sum[channel] / sum[3]).round() as u8;
+                    }
+                    target[target_index + 3] = (sum[3] / sample_area).round() as u8;
+                }
+                continue;
+            }
             let source_x = clipped.source_x
-                + ((u64::from(dest_x) * u64::from(clipped.source_width)) / u64::from(content_width))
+                + (u64::from(dest_x) * u64::from(clipped.source_width) / u64::from(content_width))
                     as u32;
             let source_index = usize::try_from(source_y)
                 .ok()?
                 .checked_mul(source_width)?
                 .checked_add(usize::try_from(source_x).ok()?)?
-                .checked_mul(4)?;
-            let target_index = usize::try_from(dest_y + y_offset)
-                .ok()?
-                .checked_mul(usize::try_from(target_width).ok()?)?
-                .checked_add(usize::try_from(dest_x + x_offset).ok()?)?
                 .checked_mul(4)?;
             target[target_index..target_index + 4]
                 .copy_from_slice(&source.data[source_index..source_index + 4]);
@@ -538,6 +718,7 @@ pub(crate) fn has_visible_pane_graphics(
                         layer,
                         &empty_uploaded,
                         false,
+                        None,
                     ))
                     .is_some()
                 })
@@ -556,6 +737,7 @@ pub(crate) fn has_visible_pane_graphics(
                     pane_id: info.id,
                     host_image_id: None,
                     area: info.inner_rect,
+                    sixel_safe_bottom: None,
                     cell_size,
                     source_key: HostSourceKey::Terminal {
                         pane_id: info.id,
@@ -1011,6 +1193,11 @@ fn encode_graphics_update(
 }
 
 pub(crate) fn clear_all_host_graphics() -> io::Result<()> {
+    if let Some(cache) = LOCAL_SIXEL_GRAPHICS.get() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.clear();
+        }
+    }
     let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
     let mut bytes = Vec::new();
     if let Ok(mut cache) = cache.lock() {
@@ -1219,6 +1406,7 @@ fn collect_visible_placements(
         pane_infos_len = surface.pane_infos.len(),
         "collect_visible_placements: starting iteration"
     );
+    let sixel_safe_bottom = sixel_safe_bottom_row(app);
     let mut placements = Vec::new();
     for info in surface.pane_infos {
         let mut pane_layers = graphics
@@ -1244,6 +1432,7 @@ fn collect_visible_placements(
                 layer,
                 uploaded_images,
                 true,
+                sixel_safe_bottom,
             ));
         }
 
@@ -1268,6 +1457,7 @@ fn collect_visible_placements(
                 pane_id: info.id,
                 host_image_id: None,
                 area: info.inner_rect,
+                sixel_safe_bottom,
                 cell_size,
                 source_key: HostSourceKey::Terminal {
                     pane_id: info.id,
@@ -1293,6 +1483,7 @@ fn pane_graphics_host_placement(
     layer: &crate::app::pane_graphics::Layer,
     uploaded_images: &HashMap<u32, ImageSignature>,
     include_data: bool,
+    sixel_safe_bottom: Option<u16>,
 ) -> HostPlacement {
     let format = pane_graphics_kitty_format(layer.format);
     let signature = pane_layer_image_signature(layer);
@@ -1317,6 +1508,7 @@ fn pane_graphics_host_placement(
         pane_id: info.id,
         host_image_id: Some(host_id),
         area: info.inner_rect,
+        sixel_safe_bottom,
         cell_size,
         source_key: HostSourceKey::PaneLayer {
             pane_id: info.id,
@@ -1428,6 +1620,7 @@ pub(crate) fn prepare_direct_file(
                 layer,
                 &cache.images,
                 false,
+                None,
             )
         })
         .and_then(|placement| direct_file_command(&placement, slot.host_image_id))
@@ -1587,6 +1780,17 @@ fn append_placement_controls(control: &mut String, clipped: ClippedPlacement) {
 }
 
 fn clipped_placement(placement: &HostPlacement) -> Option<(ClippedPlacement, u32)> {
+    clipped_placement_with_bottom_limit(placement, None)
+}
+
+fn clipped_sixel_placement(placement: &HostPlacement) -> Option<(ClippedPlacement, u32)> {
+    clipped_placement_with_bottom_limit(placement, placement.sixel_safe_bottom)
+}
+
+fn clipped_placement_with_bottom_limit(
+    placement: &HostPlacement,
+    safe_bottom: Option<u16>,
+) -> Option<(ClippedPlacement, u32)> {
     if placement.area.width == 0 || placement.area.height == 0 {
         tracing::debug!(
             area_w = placement.area.width,
@@ -1637,10 +1841,14 @@ fn clipped_placement(placement: &HostPlacement) -> Option<(ClippedPlacement, u32
         .grid_cols
         .saturating_sub(left_clip_cells)
         .min(placement.area.width as u32 - viewport_col);
-    let visible_rows = render
+    let mut visible_rows = render
         .grid_rows
         .saturating_sub(top_clip_cells)
         .min(placement.area.height as u32 - viewport_row);
+    if let Some(safe_bottom) = safe_bottom {
+        let image_y = placement.area.y.saturating_add(viewport_row as u16);
+        visible_rows = visible_rows.min(u32::from(safe_bottom.saturating_sub(image_y)));
+    }
     tracing::debug!(
         visible_cols = visible_cols,
         visible_rows = visible_rows,
@@ -1728,6 +1936,19 @@ fn clipped_placement(placement: &HostPlacement) -> Option<(ClippedPlacement, u32
         },
         format_code,
     ))
+}
+
+fn sixel_safe_bottom_row(app: &AppState) -> Option<u16> {
+    let host_bottom = [
+        app.view.sidebar_rect,
+        app.view.terminal_area,
+        app.view.tab_bar_rect,
+        app.view.mobile_header_rect,
+    ]
+    .into_iter()
+    .map(|rect| rect.y.saturating_add(rect.height))
+    .max()?;
+    (host_bottom > 0).then_some(host_bottom.saturating_sub(1))
 }
 
 fn scale_pixels(value: u32, source: u32, dest: u32) -> u32 {
@@ -1867,6 +2088,7 @@ mod tests {
             pane_id: PaneId::from_raw(1),
             host_image_id: None,
             area: Rect::new(0, 0, 20, 10),
+            sixel_safe_bottom: None,
             cell_size: HostCellSize {
                 width_px: 10,
                 height_px: 10,
@@ -1905,6 +2127,70 @@ mod tests {
     }
 
     #[test]
+    fn sixel_downsampling_preserves_thin_strokes() {
+        let source = DecodedRgba {
+            width: 8,
+            height: 8,
+            data: Cow::Owned(
+                (0..64)
+                    .flat_map(|i| {
+                        let value = if (i % 8 + i / 8) % 2 == 0 { 0 } else { 255 };
+                        [value, value, value, 255]
+                    })
+                    .collect(),
+            ),
+        };
+        let (mut clipped, _) = clipped_placement(&test_placement(0, 0)).unwrap();
+        clipped.source_width = 8;
+        clipped.source_height = 8;
+
+        let rgba = crop_scale_rgba(&source, clipped, 2, 2, 0, 0).unwrap();
+
+        assert_eq!(rgba, [128, 128, 128, 255].repeat(4));
+    }
+
+    #[test]
+    fn sixel_downsampling_weights_partial_source_pixels() {
+        let source = DecodedRgba {
+            width: 3,
+            height: 1,
+            data: Cow::Borrowed(&[0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255]),
+        };
+        let (mut clipped, _) = clipped_placement(&test_placement(0, 0)).unwrap();
+        clipped.source_width = 3;
+        clipped.source_height = 1;
+
+        let rgba = crop_scale_rgba(&source, clipped, 2, 1, 0, 0).unwrap();
+
+        assert_eq!(rgba, [85, 85, 85, 255].repeat(2));
+    }
+
+    #[test]
+    fn sixel_downsampling_respects_crop_alpha_and_placement_padding() {
+        let source = DecodedRgba {
+            width: 4,
+            height: 3,
+            data: Cow::Owned(
+                [
+                    [0, 255, 0, 255].repeat(4),
+                    [0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 255].to_vec(),
+                    [0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 255].to_vec(),
+                ]
+                .concat(),
+            ),
+        };
+        let (mut clipped, _) = clipped_placement(&test_placement(0, 0)).unwrap();
+        clipped.source_x = 1;
+        clipped.source_y = 1;
+        clipped.source_width = 2;
+        clipped.source_height = 2;
+
+        let rgba = crop_scale_rgba(&source, clipped, 2, 2, 1, 1).unwrap();
+
+        assert_eq!(rgba, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 128]);
+    }
+
+    #[test]
     fn sixel_placement_encodes_cursor_and_visible_pixel_geometry() {
         let encoded = encode_sixel_placement(&test_placement(2, 1)).expect("SIXEL placement");
         let text = String::from_utf8(encoded).unwrap();
@@ -1921,6 +2207,73 @@ mod tests {
 
         assert!(text.starts_with("\x1b[1;1H\x1bP"));
         assert!(text.contains("\"1;1;20;30"));
+    }
+
+    #[test]
+    fn sixel_cache_reuses_payload_when_only_cursor_position_changes() {
+        let mut cache = SixelGraphicsCache::default();
+        let first =
+            encode_sixel_placement_cached(&test_placement(2, 1), &mut cache).expect("first");
+
+        let mut moved = test_placement(2, 2);
+        moved.placement.data.clear();
+        let second = encode_sixel_placement_cached(&moved, &mut cache).expect("cached");
+
+        assert!(first.starts_with(b"\x1b[2;3H\x1bP"));
+        assert!(second.starts_with(b"\x1b[3;3H\x1bP"));
+        assert_eq!(&first[b"\x1b[2;3H".len()..], &second[b"\x1b[3;3H".len()..]);
+    }
+
+    #[test]
+    fn sixel_cache_reencodes_changed_image_content() {
+        let mut cache = SixelGraphicsCache::default();
+        let first =
+            encode_sixel_placement_cached(&test_placement(2, 1), &mut cache).expect("first");
+
+        let mut changed = test_placement(2, 1);
+        changed.placement.data.fill(0);
+        changed.placement.data_fingerprint += 1;
+        let second = encode_sixel_placement_cached(&changed, &mut cache).expect("changed");
+
+        assert_ne!(first, second);
+        assert_eq!(cache.payloads.len(), 1);
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        writes: Vec<usize>,
+    }
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes.push(bytes.len());
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sixel_output_uses_bounded_terminal_writes() {
+        let bytes = vec![b'x'; SIXEL_WRITE_CHUNK_BYTES * 2 + 7];
+        let mut writer = RecordingWriter::default();
+
+        write_host_output(
+            &mut writer,
+            crate::protocol::HostGraphicsProtocol::Sixel,
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(writer.bytes, bytes);
+        assert_eq!(
+            writer.writes,
+            vec![SIXEL_WRITE_CHUNK_BYTES, SIXEL_WRITE_CHUNK_BYTES, 7]
+        );
     }
 
     fn pane_layer_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {
@@ -2099,6 +2452,31 @@ mod tests {
     }
 
     #[test]
+    fn sixel_placement_leaves_the_host_terminal_bottom_row_unused() {
+        let mut placement = test_placement(0, 0);
+        placement.placement.render.grid_rows = 10;
+        placement.sixel_safe_bottom = Some(9);
+
+        let (clipped, _) =
+            clipped_sixel_placement(&placement).expect("placement above the safety row");
+
+        assert_eq!(clipped.y, 0);
+        assert_eq!(clipped.rows, 9);
+        assert_eq!(
+            clipped_placement(&placement)
+                .expect("generic placement")
+                .0
+                .rows,
+            10
+        );
+
+        let encoded = encode_sixel_placement(&placement).expect("SIXEL payload");
+        let text = String::from_utf8(encoded).expect("SIXEL is ASCII");
+        assert!(text.starts_with("\x1b[1;1H\x1bP"));
+        assert!(text.contains("\"1;1;30;90"));
+    }
+
+    #[test]
     fn pane_graphics_layer_defaults_to_full_pane_grid() {
         let info = PaneInfo {
             id: PaneId::from_raw(9),
@@ -2128,6 +2506,7 @@ mod tests {
             &layer,
             &HashMap::new(),
             true,
+            None,
         );
         let (clipped, format_code) = clipped_placement(&placement).expect("visible layer");
 

@@ -217,10 +217,10 @@ pub fn open_in_file_manager(
 }
 
 /// Unsupported platform stub.
-pub fn open_url(_url: &str) -> std::io::Result<Option<std::process::Child>> {
+pub fn open_target(_target: &std::ffi::OsStr) -> std::io::Result<Option<std::process::Child>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "opening URLs is not supported on this platform",
+        "opening links is not supported on this platform",
     ))
 }
 

@@ -156,6 +156,10 @@ env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH cargo run -- <command>
 - Targeted Windows unit tests MUST use `cargo test --locked --target
   x86_64-pc-windows-msvc --bin herdr <filter>`. Unbounded `cargo nextest run`
   attempts to compile Unix-only integration tests on Windows.
+- Binaries copied into the installed Herdr path MUST come from a release-profile
+  build. NEVER install a debug-profile artifact there: debug builds use the
+  separate `herdr-dev` config and session directories, which makes the stable
+  Spaces and user configuration appear to be missing after restart.
 - If Cargo cannot replace an in-use checkout build such as
   `target/x86_64-pc-windows-msvc/debug/herdr.exe`, rename the occupied
   executable with a timestamped `.previous` suffix, then rebuild into the
@@ -173,6 +177,9 @@ Move-Item -LiteralPath $installed -Destination $backup
 Copy-Item -LiteralPath $newBinary -Destination $installed
 & $installed --version
 ```
+
+After replacement, also inspect `& $installed --help` and confirm that its
+`Config:` line points to the stable `herdr` directory, never `herdr-dev`.
 
 Keep the renamed binary until the new executable is verified and the old
 Herdr process has exited.

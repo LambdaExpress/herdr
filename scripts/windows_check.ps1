@@ -97,4 +97,5 @@ if ($Mode -eq "lint") {
 Invoke-CargoTestFilter "windows_"
 Invoke-CargoTestFilter "server::client_transport::tests"
 Invoke-CargoTestFilter "app::tests::native_repeats_and_releases_follow_the_pressed_pane" -Exact
+Invoke-CargoTestFilter "app::actions::tests::navigator_rows_match_live_root_runtime_cwd_workspace_label" -Exact
 Invoke-Checked cargo @("build", "--locked", "--target", "x86_64-pc-windows-msvc")

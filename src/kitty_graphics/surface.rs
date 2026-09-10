@@ -197,6 +197,13 @@ impl ClientState {
             return bytes;
         }
 
+        // SIXEL rasters must match the host's fixed virtual cell grid, so the
+        // reported geometry never scales them.
+        let cell_size = if self.protocol.is_sixel() {
+            super::sixel::SIXEL_CELL_SIZE
+        } else {
+            cell_size
+        };
         let mut placements = self
             .scene
             .placements
@@ -954,6 +961,74 @@ mod tests {
         ))
         .unwrap();
         assert!(removed.contains(&format!("a=d,d=I,i={image_id}")));
+    }
+
+    #[test]
+    fn sixel_protocol_encodes_the_scene_as_positioned_sixel_instead_of_kitty() {
+        let mut state = ClientState::default();
+        state.set_scope("endpoint-a:boot-1");
+        state.set_protocol(super::super::sixel::HostGraphicsProtocol::Sixel);
+        let image = asset(
+            SurfaceGraphicsTarget::Pane {
+                pane_id: "w1:p1".into(),
+            },
+            20,
+            vec![255, 0, 0, 255],
+        );
+        state.set_scene(scene(image, 1, 2));
+
+        // Deliberately wrong reported geometry: SIXEL must ignore it.
+        let bytes = state.encode(
+            Visibility::Main,
+            (10, 5),
+            None,
+            HostCellSize {
+                width_px: 40,
+                height_px: 40,
+            },
+            None,
+        );
+        let text = String::from_utf8_lossy(&bytes);
+
+        assert!(text.contains("\u{1b}P"), "sixel DCS expected: {text:?}");
+        assert!(
+            !text.contains("\u{1b}_G"),
+            "kitty APC must not appear on a sixel host: {text:?}"
+        );
+        assert!(text.starts_with("\u{1b}[8;12H"), "{text:?}");
+        assert!(
+            text.contains(";10;20"),
+            "the raster follows the virtual cell grid, not the reported geometry: {text:?}"
+        );
+    }
+
+    #[test]
+    fn kitty_protocol_still_emits_kitty_commands() {
+        let mut state = ClientState::default();
+        state.set_scope("endpoint-a:boot-1");
+        let image = asset(
+            SurfaceGraphicsTarget::Pane {
+                pane_id: "w1:p1".into(),
+            },
+            20,
+            vec![255, 0, 0, 255],
+        );
+        state.set_scene(scene(image, 1, 2));
+
+        let bytes = state.encode(
+            Visibility::Main,
+            (10, 5),
+            None,
+            HostCellSize {
+                width_px: 8,
+                height_px: 16,
+            },
+            None,
+        );
+        let text = String::from_utf8_lossy(&bytes);
+
+        assert!(text.contains("\u{1b}_Ga=t"), "{text:?}");
+        assert!(!text.contains("\u{1b}P"), "{text:?}");
     }
 
     #[test]

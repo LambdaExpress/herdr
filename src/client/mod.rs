@@ -192,6 +192,13 @@ fn run_client_with_mode(
 
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
+    // Which host protocol the client emits decides the cell geometry it reports
+    // and whether SIXEL-specific sizing applies, so record the decision.
+    info!(
+        protocol = ?host_graphics_protocol,
+        kitty_graphics_enabled,
+        "client host graphics protocol"
+    );
 
     let endpoint_catalog = if client_rendered_shell && !is_remote_client_process() {
         endpoint::EndpointCatalog::load().unwrap_or_else(|error| {

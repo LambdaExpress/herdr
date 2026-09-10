@@ -136,6 +136,14 @@ impl SixelGraphicsCache {
         self.images.clear();
         self.payloads.clear();
     }
+
+    /// Whether decoded pixels for `image` are already cached.
+    ///
+    /// Callers use this to skip handing the encoder another copy of a raster it
+    /// decoded on an earlier frame.
+    pub(super) fn has_image(&self, image: ImageSignature) -> bool {
+        self.images.contains_key(&image)
+    }
 }
 
 /// Encodes every visible placement as positioned SIXEL payloads.
@@ -622,6 +630,50 @@ mod tests {
         assert_eq!(clipped_rows, 2, "the bottom host row stays unused");
         assert_eq!(cursor_row, 7);
         assert!(String::from_utf8_lossy(&encoded).starts_with("\u{1b}[8;1H"));
+    }
+
+    #[test]
+    fn sixel_encodes_a_revealed_crop_from_retained_pixels() {
+        // A two-row source whose rows differ, so a wrong crop is visible.
+        let mut placement = test_placement(0, 0);
+        placement.area = Rect::new(0, 0, 1, 1);
+        placement.cell_size = SIXEL_CELL_SIZE;
+        placement.placement.image_width = 1;
+        placement.placement.image_height = 2;
+        placement.placement.data = vec![255, 0, 0, 255, 0, 0, 255, 255];
+        placement.placement.data_len = placement.placement.data.len();
+        placement.placement.render.grid_cols = 1;
+        placement.placement.render.grid_rows = 1;
+        placement.placement.render.source_x = 0;
+        placement.placement.render.source_y = 0;
+        placement.placement.render.source_width = 1;
+        placement.placement.render.source_height = 1;
+
+        let mut cache = SixelGraphicsCache::default();
+        let top = encode_sixel_placements(std::slice::from_mut(&mut placement), None, &mut cache);
+        // Encoding consumed the pixel buffer, so the next frame carries no data,
+        // which is what a frame that no longer retransmits the image looks like.
+        assert!(placement.placement.data.is_empty());
+
+        // Scrolling reveals the second row.
+        placement.placement.render.source_y = 1;
+        let bottom =
+            encode_sixel_placements(std::slice::from_mut(&mut placement), None, &mut cache);
+
+        let top = icy_sixel::SixelImage::decode(&top).expect("decode top crop");
+        let bottom = icy_sixel::SixelImage::decode(&bottom).expect("decode bottom crop");
+        // The encoder pads the final band to a multiple of six rows, so only the
+        // rows the placement asked for carry color.
+        const CONTENT_ROWS: usize = 20;
+        let content_len = 10 * CONTENT_ROWS * 4;
+        let expected_top = [255, 0, 0, 255].repeat(10 * CONTENT_ROWS);
+        let expected_bottom = [0, 0, 255, 255].repeat(10 * CONTENT_ROWS);
+
+        assert_eq!(top.width, 10);
+        assert_eq!(bottom.width, 10);
+        assert!(top.height >= CONTENT_ROWS && bottom.height >= CONTENT_ROWS);
+        assert_eq!(top.pixels[..content_len], expected_top[..]);
+        assert_eq!(bottom.pixels[..content_len], expected_bottom[..]);
     }
 
     #[test]

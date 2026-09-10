@@ -61,6 +61,16 @@ impl ClientState {
         self.reset_pending = true;
     }
 
+    /// Whether the encoder already holds this asset's decoded pixels.
+    ///
+    /// A frame that still lists an image otherwise copies its whole raster for
+    /// every placement, so an image spanning many rows pays that cost per row.
+    /// Only SIXEL keeps decoded rasters; the Kitty path uploads the bytes and
+    /// therefore always needs them.
+    fn sixel_can_reuse_asset_pixels(&self, key: &SurfaceGraphicsAssetKey) -> bool {
+        self.protocol.is_sixel() && self.sixel.has_image(asset_image_signature(key))
+    }
+
     pub(crate) fn scope(&self) -> &str {
         &self.scope
     }
@@ -209,10 +219,14 @@ impl ClientState {
             .placements
             .iter()
             .filter_map(|placement| {
+                let mut data = self.assets.get(&placement.asset).map(Vec::as_slice);
+                if self.sixel_can_reuse_asset_pixels(&placement.asset) {
+                    data = None;
+                }
                 client_host_placement(
                     &self.scope,
                     placement,
-                    self.assets.get(&placement.asset).map(Vec::as_slice),
+                    data,
                     visibility,
                     main_origin,
                     popup_origin,
@@ -601,13 +615,7 @@ fn client_host_placement(
         scope: scope.to_owned(),
         source: placement.asset.source.clone(),
     };
-    let signature = ImageSignature {
-        image_width: placement.asset.image_width,
-        image_height: placement.asset.image_height,
-        format_code: format_code(placement.asset.format),
-        data_len: usize::try_from(placement.asset.data_len).unwrap_or(usize::MAX),
-        data_fingerprint: placement.asset.data_fingerprint,
-    };
+    let signature = asset_image_signature(&placement.asset);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     scope.hash(&mut hasher);
     placement.asset.source.hash(&mut hasher);
@@ -659,6 +667,20 @@ fn client_host_placement(
         },
         scrollback_offset: placement.scrollback_offset,
     })
+}
+
+/// Identifies one asset's source raster across frames.
+///
+/// The SIXEL cache and the encoder must derive this the same way, or a cached
+/// raster would be looked up under a different key than it was stored under.
+fn asset_image_signature(key: &SurfaceGraphicsAssetKey) -> ImageSignature {
+    ImageSignature {
+        image_width: key.image_width,
+        image_height: key.image_height,
+        format_code: format_code(key.format),
+        data_len: usize::try_from(key.data_len).unwrap_or(usize::MAX),
+        data_fingerprint: key.data_fingerprint,
+    }
 }
 
 fn format_code(format: SurfaceGraphicsFormat) -> u32 {
@@ -961,6 +983,85 @@ mod tests {
         ))
         .unwrap();
         assert!(removed.contains(&format!("a=d,d=I,i={image_id}")));
+    }
+
+    #[test]
+    fn sixel_skips_recopying_a_raster_it_already_decoded() {
+        let mut state = ClientState::default();
+        state.set_scope("endpoint-a:boot-1");
+        state.set_protocol(super::super::sixel::HostGraphicsProtocol::Sixel);
+        let image = asset(
+            SurfaceGraphicsTarget::Pane {
+                pane_id: "w1:p1".into(),
+            },
+            20,
+            vec![255, 0, 0, 255],
+        );
+        let key = image.key.clone();
+        state.set_scene(scene(image, 1, 2));
+
+        assert!(
+            !state.sixel_can_reuse_asset_pixels(&key),
+            "a cold cache has to copy the raster"
+        );
+        let first = state.encode(
+            Visibility::Main,
+            (10, 5),
+            None,
+            HostCellSize {
+                width_px: 8,
+                height_px: 16,
+            },
+            None,
+        );
+        assert!(!first.is_empty());
+        assert!(
+            state.sixel_can_reuse_asset_pixels(&key),
+            "a decoded raster must not be copied again"
+        );
+
+        let second = state.encode(
+            Visibility::Main,
+            (10, 5),
+            None,
+            HostCellSize {
+                width_px: 8,
+                height_px: 16,
+            },
+            None,
+        );
+        assert_eq!(second, first, "reuse must not change the encoded output");
+    }
+
+    #[test]
+    fn kitty_hosts_always_keep_asset_pixels_available_for_upload() {
+        let mut state = ClientState::default();
+        state.set_scope("endpoint-a:boot-1");
+        let image = asset(
+            SurfaceGraphicsTarget::Pane {
+                pane_id: "w1:p1".into(),
+            },
+            20,
+            vec![255, 0, 0, 255],
+        );
+        let key = image.key.clone();
+        state.set_scene(scene(image, 1, 2));
+
+        state.encode(
+            Visibility::Main,
+            (10, 5),
+            None,
+            HostCellSize {
+                width_px: 8,
+                height_px: 16,
+            },
+            None,
+        );
+
+        assert!(
+            !state.sixel_can_reuse_asset_pixels(&key),
+            "a Kitty host must still be handed the bytes it uploads"
+        );
     }
 
     #[test]

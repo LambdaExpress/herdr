@@ -3,10 +3,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_void, OsStr},
     mem::{size_of, MaybeUninit},
-    os::windows::{
-        ffi::OsStrExt,
-        io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    },
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::PathBuf,
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
@@ -18,12 +15,140 @@ use std::{
 
 mod clipboard_image;
 
+pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
+    // STATUS_CONTROL_C_EXIT is reported without a Unix signal by portable-pty.
+    if status.exit_code() == 0xC000013A {
+        super::ChildExitReason::Interrupted
+    } else {
+        super::ChildExitReason::Exited
+    }
+}
+
+pub(crate) struct RemoteBridgeWake;
+
+impl RemoteBridgeWake {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn cancel(&self) -> std::io::Result<()> {
+        // The named-pipe reader checks its cancellation flag between peeks.
+        Ok(())
+    }
+
+    pub(crate) fn wait(&self, _stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+        // Synchronous named pipes still use peek-before-read polling on Windows.
+        std::thread::sleep(Duration::from_millis(1));
+        Ok(())
+    }
+}
+
+pub(crate) fn wait_client_stream_readable(
+    _stream: &crate::ipc::LocalStream,
+) -> std::io::Result<()> {
+    // Sync named pipes have no read timeout. The caller peeks before each read and checks its
+    // cancellation flag between polls, including when a frame arrives in several fragments.
+    std::thread::sleep(Duration::from_millis(2));
+    Ok(())
+}
+
+pub(crate) fn forward_remote_bridge_stdio(stream: crate::ipc::LocalStream) -> std::io::Result<()> {
+    use interprocess::TryClone as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut stdout = std::io::stdout().lock();
+    let mut socket_to_stdout = stream.try_clone()?;
+    let mut stdin_to_socket = stream;
+    let upload_done = Arc::new(AtomicBool::new(false));
+    let upload_done_worker = Arc::clone(&upload_done);
+    let _upload = std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
+        upload_done_worker.store(true, Ordering::Release);
+    });
+
+    let mut buffer = [0_u8; 16 * 1024];
+    while !upload_done.load(Ordering::Acquire) {
+        match crate::ipc::poll_local_stream_read_count(&mut socket_to_stdout, &mut buffer)? {
+            crate::ipc::LocalStreamReadCount::Data(read) => {
+                std::io::Write::write_all(&mut stdout, &buffer[..read])?;
+                std::io::Write::flush(&mut stdout)?;
+            }
+            crate::ipc::LocalStreamReadCount::Pending => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            crate::ipc::LocalStreamReadCount::Closed => break,
+        }
+    }
+    Ok(())
+}
+
+fn copy_flush<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        writer.write_all(&buffer[..read])?;
+        writer.flush()?;
+    }
+}
+
+pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
+    crossterm::terminal::size()
+}
+
+pub(crate) fn replace_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn set_default_plugin_pane_pwd(
+    _env: &mut Vec<(String, String)>,
+    _cwd: &std::path::Path,
+) {
+}
+
 use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
     Win32::{
         Foundation::{
             CloseHandle, GlobalFree, LocalFree, FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE,
-            NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
+            MAX_PATH, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
         Security::SECURITY_ATTRIBUTES,
@@ -65,8 +190,8 @@ use windows_sys::{
             Input::{
                 Ime::ImmGetDefaultIMEWnd,
                 KeyboardAndMouse::{
-                    GetKeyboardLayout, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-                    KEYEVENTF_KEYUP,
+                    GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0, INPUT_KEYBOARD,
+                    KEYBDINPUT, KEYEVENTF_KEYUP,
                 },
             },
             Shell::{
@@ -95,6 +220,74 @@ pub(crate) fn terminal_title_for_presentation(title: &str) -> &str {
     title.strip_prefix("Administrator: ").unwrap_or(title)
 }
 
+pub(crate) fn prepare_paste_text_for_pty_platform(text: String) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+pub(crate) fn plugin_runtime_path_platform(path: &std::path::Path) -> PathBuf {
+    use std::os::windows::ffi::OsStrExt;
+
+    let Some(candidate) = standard_windows_path(path) else {
+        return path.to_path_buf();
+    };
+    // Rust can canonicalize a long standard path by adding its own verbatim prefix, but native
+    // process consumers still need the original prefix when the plugin root exceeds MAX_PATH.
+    if candidate.join("").as_os_str().encode_wide().count() >= MAX_PATH as usize {
+        return path.to_path_buf();
+    }
+    match candidate.canonicalize() {
+        Ok(canonical) if canonical == path => candidate,
+        _ => path.to_path_buf(),
+    }
+}
+
+fn standard_windows_path(path: &std::path::Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    let mut candidate = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut candidate = PathBuf::from(r"\\");
+            candidate.push(server);
+            candidate.push(share);
+            candidate
+        }
+        _ => return None,
+    };
+    candidate.push(components.as_path());
+    Some(candidate)
+}
+
+/// Resolves against the current foreground layout because asynchronous console
+/// records do not retain the layout that was active when the key was pressed.
+pub(crate) fn resolve_base_printable_key(vk: u16, scan: u16) -> Option<char> {
+    // SAFETY: Win32 owns the handles; the fixed buffers match the API lengths.
+    unsafe {
+        let thread_id = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+        let layout = GetKeyboardLayout(thread_id);
+
+        let key_state = [0u8; 256];
+        let mut output = [0u16; 2];
+        let written = ToUnicodeEx(
+            vk.into(),
+            scan.into(),
+            key_state.as_ptr(),
+            output.as_mut_ptr(),
+            output.len() as i32,
+            0x4,
+            layout,
+        );
+        let units = output.get(..usize::try_from(written).ok()?)?;
+        let mut chars = char::decode_utf16(units.iter().copied());
+        let ch = chars.next()?.ok()?;
+        (chars.next().is_none() && !ch.is_control()).then_some(ch)
+    }
+}
+
 const MAX_PROCESS_ENVIRONMENT_BYTES: usize = 256 * 1024;
 const PROCESS_ENVIRONMENT_READ_CHUNK_BYTES: usize = 16 * 1024;
 const PROCESS_RUNTIME_MARKER_CACHE_CAPACITY: usize = 1_024;
@@ -116,17 +309,6 @@ pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
             .map(PathBuf::from)
             .map(|dir| dir.join("ssh").join("ssh_config")),
         multiplexing: false,
-    }
-}
-
-pub(crate) fn path_for_user_display_platform(path: &std::path::Path) -> String {
-    let path = path.to_string_lossy();
-    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{path}")
-    } else if let Some(path) = path.strip_prefix(r"\\?\") {
-        path.to_owned()
-    } else {
-        path.into_owned()
     }
 }
 
@@ -529,45 +711,24 @@ fn powershell_agent_script(argv: &[String]) -> Option<String> {
         return Some(format!("& {}", super::quote_powershell_arg(program)));
     }
 
+    let powershell_args = args
+        .iter()
+        .map(|arg| super::quote_powershell_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
     let command_line = args
         .iter()
-        .map(|arg| quote_windows_command_line_arg(arg))
+        .map(|arg| super::quote_windows_command_line_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
-        "$p=Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait -PassThru",
+        "if((Get-Command {} -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){{& {} {}}}else{{Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait}}",
+        super::quote_powershell_arg(program),
+        super::quote_powershell_arg(program),
+        powershell_args,
         super::quote_powershell_arg(program),
         super::quote_powershell_arg(&command_line),
     ))
-}
-
-fn quote_windows_command_line_arg(value: &str) -> String {
-    if !value.is_empty()
-        && !value
-            .chars()
-            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\x0b' | '"'))
-    {
-        return value.to_string();
-    }
-
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for ch in value.chars() {
-        if ch == '\\' {
-            backslashes += 1;
-            continue;
-        }
-        if ch == '"' {
-            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
-        } else {
-            quoted.push_str(&"\\".repeat(backslashes));
-        }
-        backslashes = 0;
-        quoted.push(ch);
-    }
-    quoted.push_str(&"\\".repeat(backslashes * 2));
-    quoted.push('"');
-    quoted
 }
 
 fn cmd_encoded_powershell_command(script: &str) -> String {
@@ -874,7 +1035,7 @@ fn windows_command_line(command: &std::process::Command) -> std::io::Result<Stri
         .chain(command.get_args())
         .map(|value| {
             unicode_windows_value(value, "server command argument")
-                .map(|value| quote_windows_command_line_arg(&value))
+                .map(|value| super::quote_windows_command_line_arg(&value))
         })
         .collect::<std::io::Result<Vec<_>>>()
         .map(|parts| parts.join(" "))
@@ -1904,37 +2065,25 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
+/// Converts a path to the form Windows Explorer and ShellExecuteW expect,
+/// dropping the verbatim prefixes Rust adds for long paths.
+pub(crate) fn path_for_user_display_platform(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        path.to_owned()
+    } else {
+        path.into_owned()
+    }
+}
+
+/// Whether this process can show a graphical file manager window.
 pub fn file_manager_available() -> bool {
     !unsafe { GetShellWindow() }.is_null()
 }
 
-fn shell_execute_open(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
-    let target: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
-    let operation = wide_null("open");
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            target.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-        )
-    };
-    if result as isize > 32 {
-        Ok(None)
-    } else {
-        Err(std::io::Error::other(format!(
-            "failed to open target with ShellExecuteW: code {}",
-            result as isize
-        )))
-    }
-}
-
-pub fn open_target(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
-    shell_execute_open(target)
-}
-
+/// Builds the `explorer.exe` invocation that reveals `path` in a new window.
 fn file_manager_command(
     path: &std::path::Path,
     system_root: Option<&OsStr>,
@@ -1965,6 +2114,35 @@ pub fn open_in_file_manager(
     file_manager_command(path, system_root.as_deref())?
         .spawn()
         .map(Some)
+}
+
+fn shell_execute_open(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let target: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
+    let operation = wide_null("open");
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if result as isize > 32 {
+        Ok(None)
+    } else {
+        Err(std::io::Error::other(format!(
+            "failed to open target with ShellExecuteW: code {}",
+            result as isize
+        )))
+    }
+}
+
+pub fn open_target(target: &OsStr) -> std::io::Result<Option<std::process::Child>> {
+    shell_execute_open(target)
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -2577,41 +2755,77 @@ mod tests {
     };
 
     #[test]
-    fn user_display_path_removes_windows_verbatim_prefixes() {
+    fn windows_standard_plugin_runtime_paths_drop_only_disk_and_unc_verbatim_prefixes() {
         assert_eq!(
-            super::path_for_user_display_platform(std::path::Path::new(r"\\?\D:\project\herdr")),
-            r"D:\project\herdr"
+            super::standard_windows_path(std::path::Path::new(r"\\?\C:\plugins\example")),
+            Some(std::path::PathBuf::from(r"C:\plugins\example"))
         );
         assert_eq!(
-            super::path_for_user_display_platform(std::path::Path::new(
-                r"\\?\UNC\server\share\project"
+            super::standard_windows_path(std::path::Path::new(
+                r"\\?\UNC\server\share\plugins\example"
             )),
-            r"\\server\share\project"
+            Some(std::path::PathBuf::from(r"\\server\share\plugins\example"))
         );
         assert_eq!(
-            super::path_for_user_display_platform(std::path::Path::new(r"D:\project\herdr")),
-            r"D:\project\herdr"
+            super::standard_windows_path(std::path::Path::new(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\plugins"
+            )),
+            None
         );
     }
 
     #[test]
-    fn file_manager_command_forces_a_new_explorer_window() {
-        let command = super::file_manager_command(
-            std::path::Path::new(r"\\?\D:\project space\herdr"),
-            Some(std::ffi::OsStr::new(r"C:\Windows")),
-        )
-        .expect("build explorer command");
+    fn windows_plugin_runtime_path_keeps_extended_path_when_normal_form_is_not_equivalent() {
+        let path = std::path::PathBuf::from(format!(
+            r"\\?\C:\herdr-missing-plugin-runtime-path-{}",
+            std::process::id()
+        ));
+        assert_eq!(super::plugin_runtime_path_platform(&path), path);
+    }
 
+    #[test]
+    fn windows_plugin_runtime_path_keeps_verbatim_root_beyond_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "herdr-plugin-runtime-path-limit-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).expect("create test base");
+        let extended_base = base.canonicalize().expect("canonicalize test base");
+        let normal_base = super::standard_windows_path(&extended_base)
+            .expect("test base has a standard drive path");
+        let normal_base_len = normal_base.as_os_str().encode_wide().count();
+        let root_at_length = |length| {
+            let component_len = length - normal_base_len - 1;
+            let path = extended_base.join("é".repeat(component_len));
+            fs::create_dir(&path).expect("create length-boundary test root");
+            path.canonicalize()
+                .expect("canonicalize length-boundary test root")
+        };
+
+        let at_limit = root_at_length(windows_sys::Win32::Foundation::MAX_PATH as usize - 2);
+        let at_limit_normal =
+            super::standard_windows_path(&at_limit).expect("convert root at MAX_PATH boundary");
         assert_eq!(
-            command.get_program(),
-            std::ffi::OsStr::new(r"C:\Windows\explorer.exe")
+            super::plugin_runtime_path_platform(&at_limit),
+            at_limit_normal
         );
+
+        let beyond_limit = root_at_length(windows_sys::Win32::Foundation::MAX_PATH as usize - 1);
         assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            vec![
-                std::ffi::OsStr::new("/n,"),
-                std::ffi::OsStr::new(r"D:\project space\herdr")
-            ]
+            super::plugin_runtime_path_platform(&beyond_limit),
+            beyond_limit
+        );
+
+        fs::remove_dir_all(base).expect("remove test directory");
+    }
+
+    #[test]
+    fn paste_text_uses_windows_line_endings() {
+        assert_eq!(
+            super::prepare_paste_text_for_pty_platform("one\ntwo\r\nthree\rfour".to_owned()),
+            "one\r\ntwo\r\nthree\rfour"
         );
     }
 
@@ -2633,27 +2847,27 @@ mod tests {
     #[test]
     fn windows_conpty_native_encoder_uses_canonical_phase_and_repeat_count() {
         let key = crate::input::TerminalKey::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::empty(),
+            crossterm::event::KeyCode::Char('7'),
+            crossterm::event::KeyModifiers::CONTROL,
         )
         .with_windows_record(crate::input::WindowsKeyRecord {
             key_down: true,
             repeat_count: 3,
-            virtual_key_code: 27,
-            virtual_scan_code: 1,
-            unicode: 27,
-            control_key_state: 0,
+            virtual_key_code: 0x37,
+            virtual_scan_code: 0x08,
+            unicode: 0,
+            control_key_state: 0x0008,
         });
 
         assert_eq!(
             super::encode_windows_conpty_fallback(&key),
-            Some(b"\x1b[27;1;27;1;0;3_".to_vec())
+            Some(b"\x1b[55;8;0;1;8;3_".to_vec())
         );
         let mut release = key.with_kind(crossterm::event::KeyEventKind::Release);
         release.repeat_count = 3;
         assert_eq!(
             super::encode_windows_conpty_fallback(&release),
-            Some(b"\x1b[27;1;27;0;0;1_".to_vec())
+            Some(b"\x1b[55;8;0;0;8;1_".to_vec())
         );
     }
 
@@ -2727,6 +2941,45 @@ mod tests {
     }
 
     #[test]
+    fn user_display_path_removes_windows_verbatim_prefixes() {
+        assert_eq!(
+            super::path_for_user_display_platform(std::path::Path::new(r"\\?\D:\project\herdr")),
+            r"D:\project\herdr"
+        );
+        assert_eq!(
+            super::path_for_user_display_platform(std::path::Path::new(
+                r"\\?\UNC\server\share\project"
+            )),
+            r"\\server\share\project"
+        );
+        assert_eq!(
+            super::path_for_user_display_platform(std::path::Path::new(r"D:\project\herdr")),
+            r"D:\project\herdr"
+        );
+    }
+
+    #[test]
+    fn file_manager_command_forces_a_new_explorer_window() {
+        let command = super::file_manager_command(
+            std::path::Path::new(r"\\?\D:\project space\herdr"),
+            Some(std::ffi::OsStr::new(r"C:\Windows")),
+        )
+        .expect("build explorer command");
+
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new(r"C:\Windows\explorer.exe")
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                std::ffi::OsStr::new("/n,"),
+                std::ffi::OsStr::new(r"D:\project space\herdr")
+            ]
+        );
+    }
+
+    #[test]
     fn powershell_agent_command_omits_argument_list_when_no_arguments_are_passed() {
         let argv = vec!["opencode".into()];
 
@@ -2748,6 +3001,7 @@ mod tests {
             "100%".into(),
             "wow!".into(),
             "a'b".into(),
+            "--model".into(),
         ];
         let command = super::interactive_shell_command(&argv, "cmd.exe").unwrap();
         let encoded = command.split_whitespace().last().unwrap();
@@ -2760,7 +3014,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             String::from_utf16(&utf16).unwrap(),
-            "$p=Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b' -NoNewWindow -Wait -PassThru"
+            "if((Get-Command pi -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){& pi '' 'two words' '100%' 'wow!' 'a''b' '--model'}else{Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b --model' -NoNewWindow -Wait}"
         );
     }
 
@@ -2779,7 +3033,7 @@ mod tests {
         let helper = base.join("pi.cmd");
         fs::write(
             &helper,
-            "@echo off\r\n>\"%HERDR_ARGV_CAPTURE%\" (\r\necho(%~1\r\necho(%~2\r\necho(%~3\r\necho(%~4\r\necho(%~5\r\necho(%~6\r\n)\r\n",
+            "@echo off\r\n>\"%HERDR_ARGV_CAPTURE%\" (\r\necho(%~1\r\necho(%~2\r\necho(%~3\r\necho(%~4\r\necho(%~5\r\necho(%~6\r\necho(%~7\r\n)\r\n",
         )
         .unwrap();
         let argv = vec![
@@ -2790,6 +3044,7 @@ mod tests {
             "wow!".into(),
             "a'b".into(),
             "@options".into(),
+            "--model".into(),
         ];
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let path = format!("{};{}", base.display(), inherited_path.to_string_lossy());
@@ -2806,6 +3061,7 @@ mod tests {
             process
                 .env("PATH", &path)
                 .env("HERDR_ARGV_CAPTURE", capture)
+                .env("PSExecutionPolicyPreference", "Bypass")
                 .status()
                 .unwrap()
         };
@@ -2819,7 +3075,7 @@ mod tests {
                 fs::read_to_string(no_args_capture)
                     .unwrap()
                     .replace("\r\n", "\n"),
-                "\n\n\n\n\n\n"
+                "\n\n\n\n\n\n\n"
             );
 
             let capture = base.join(format!("{shell}.txt"));
@@ -2828,7 +3084,24 @@ mod tests {
             assert!(status.success(), "{shell} command failed");
             assert_eq!(
                 fs::read_to_string(capture).unwrap().replace("\r\n", "\n"),
-                "\ntwo words\n100%\nwow!\na'b\n@options\n"
+                "\ntwo words\n100%\nwow!\na'b\n@options\n--model\n"
+            );
+        }
+
+        fs::remove_file(helper).unwrap();
+        fs::write(
+            base.join("pi.ps1"),
+            "Set-Content -LiteralPath $env:HERDR_ARGV_CAPTURE -Value @(\"$($args[0])\", \"$($args[1])\", \"$($args[2])\", \"$($args[3])\", \"$($args[4])\", \"$($args[5])\", \"$($args[6])\")\r\n",
+        )
+        .unwrap();
+        for shell in ["powershell.exe", "cmd.exe"] {
+            let capture = base.join(format!("{shell}-ps1.txt"));
+            let command = super::interactive_shell_command(&argv, shell).unwrap();
+            let status = run_command(shell, &command, &capture);
+            assert!(status.success(), "{shell} PowerShell script command failed");
+            assert_eq!(
+                fs::read_to_string(capture).unwrap().replace("\r\n", "\n"),
+                "\ntwo words\n100%\nwow!\na'b\n@options\n--model\n"
             );
         }
 
@@ -2854,9 +3127,10 @@ mod tests {
             fs::write(
                 capture,
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
                     cwd.display(),
-                    super::current_process_is_detached_server_daemon()
+                    unsafe { GetConsoleWindow() }.is_null(),
+                    !super::current_job_kills_processes_on_close().expect("inspect WMI daemon job")
                 ),
             )
             .expect("write WMI daemon test capture");
@@ -2887,7 +3161,7 @@ mod tests {
             .expect("launch detached process through WMI");
         assert_ne!(pid, 0, "WMI returned an invalid process id");
 
-        let expected = format!("{}\ntrue", base.display());
+        let expected = format!("{}\ntrue\ntrue", base.display());
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if fs::read_to_string(&capture).is_ok_and(|captured| captured == expected) {

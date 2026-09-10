@@ -26,6 +26,7 @@ mod agent;
 mod api;
 mod completion;
 mod integration;
+mod machine;
 mod notification;
 mod pane;
 mod plugin;
@@ -113,6 +114,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
+        "machine" => machine::run_machine_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
@@ -964,8 +966,11 @@ fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
 fn parse_session_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), i32> {
     let mut name = None;
     let mut json = false;
+    let mut options_ended = false;
     for arg in args {
-        if arg == "--json" {
+        if !options_ended && arg == "--" {
+            options_ended = true;
+        } else if !options_ended && arg == "--json" {
             json = true;
         } else if name.is_none() {
             name = Some(arg.clone());
@@ -1083,6 +1088,16 @@ mod tests {
             super::channel_set_install_action(None),
             super::ChannelSetInstallAction::RunSelfUpdate
         );
+    }
+
+    #[test]
+    fn session_name_parser_accepts_option_terminator() {
+        for name in ["-h", "--json"] {
+            assert_eq!(
+                super::parse_session_name_and_json(&["--".to_string(), name.to_string()], "usage",),
+                Ok((name.to_string(), false))
+            );
+        }
     }
 
     #[test]

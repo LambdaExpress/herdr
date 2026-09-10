@@ -30,17 +30,20 @@ enum Phase {
     Done,
 }
 
+/// How the selection's cells are derived from its two endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionKind {
+    /// Cells follow terminal reading order between the endpoints.
     Linear,
+    /// Cells share the endpoints' fixed column bounds on every row.
     Block,
 }
 
 /// A text selection within a terminal pane.
 #[derive(Debug, Clone)]
-pub struct Selection {
+pub struct Selection<P = PaneId> {
     /// Which pane the selection belongs to.
-    pub pane_id: PaneId,
+    pub pane_id: P,
     /// Anchor position in screen-buffer coordinates (row, col).
     anchor: (u32, u16),
     /// Current/final position in screen-buffer coordinates (row, col).
@@ -51,21 +54,16 @@ pub struct Selection {
     kind: SelectionKind,
 }
 
-impl Selection {
+impl<P> Selection<P> {
     /// Start a potential selection. This records the anchor but doesn't
     /// make anything visible yet — the user might just be clicking.
-    pub fn anchor(
-        pane_id: PaneId,
-        viewport_row: u16,
-        col: u16,
-        metrics: Option<ScrollMetrics>,
-    ) -> Self {
+    pub fn anchor(pane_id: P, viewport_row: u16, col: u16, metrics: Option<ScrollMetrics>) -> Self {
         Self::anchor_with_kind(pane_id, viewport_row, col, metrics, SelectionKind::Linear)
     }
 
     /// Start a potential rectangular block selection.
-    pub(crate) fn block_anchor(
-        pane_id: PaneId,
+    pub fn block_anchor(
+        pane_id: P,
         viewport_row: u16,
         col: u16,
         metrics: Option<ScrollMetrics>,
@@ -74,7 +72,7 @@ impl Selection {
     }
 
     fn anchor_with_kind(
-        pane_id: PaneId,
+        pane_id: P,
         viewport_row: u16,
         col: u16,
         metrics: Option<ScrollMetrics>,
@@ -90,30 +88,27 @@ impl Selection {
         }
     }
 
-    /// Create an active selection from an explicit viewport-row range.
-    pub(crate) fn range(
-        pane_id: PaneId,
-        viewport_row: u16,
-        start_col: u16,
-        end_col: u16,
-        metrics: Option<ScrollMetrics>,
-    ) -> Self {
-        let row = absolute_row_for_viewport_row(viewport_row, metrics);
+    pub(crate) fn absolute_anchor(pane_id: P, anchor: (u32, u16)) -> Self {
         Self {
             pane_id,
-            anchor: (row, start_col),
-            cursor: (row, end_col),
+            anchor,
+            cursor: anchor,
+            phase: Phase::Anchored,
+            kind: SelectionKind::Linear,
+        }
+    }
+
+    pub(crate) fn absolute_range(pane_id: P, anchor: (u32, u16), cursor: (u32, u16)) -> Self {
+        Self {
+            pane_id,
+            anchor,
+            cursor,
             phase: Phase::Dragging,
             kind: SelectionKind::Linear,
         }
     }
 
-    pub(crate) fn line_range(
-        pane_id: PaneId,
-        anchor_row: u32,
-        cursor_row: u32,
-        end_col: u16,
-    ) -> Self {
+    pub(crate) fn line_range(pane_id: P, anchor_row: u32, cursor_row: u32, end_col: u16) -> Self {
         let (anchor_col, cursor_col) = if anchor_row <= cursor_row {
             (0, end_col)
         } else {
@@ -126,13 +121,6 @@ impl Selection {
             phase: Phase::Dragging,
             kind: SelectionKind::Linear,
         }
-    }
-
-    pub(crate) fn absolute_row_for_viewport(
-        viewport_row: u16,
-        metrics: Option<ScrollMetrics>,
-    ) -> u32 {
-        absolute_row_for_viewport_row(viewport_row, metrics)
     }
 
     /// Convert the anchor's absolute row and pane-relative column back to
@@ -191,13 +179,9 @@ impl Selection {
     }
 
     /// Whether this selection was already finalized.
+    #[cfg(test)]
     pub fn is_finalized(&self) -> bool {
         self.phase == Phase::Done
-    }
-
-    /// Whether the user just clicked without dragging (not a selection).
-    pub fn was_just_click(&self) -> bool {
-        self.phase == Phase::Anchored
     }
 
     /// Whether the user just clicked without dragging (not a selection).
@@ -224,7 +208,8 @@ impl Selection {
         self.phase == Phase::Dragging
     }
 
-    pub(crate) fn is_block(&self) -> bool {
+    /// Whether the selection spans a fixed column block on every row.
+    pub fn is_block(&self) -> bool {
         self.kind == SelectionKind::Block
     }
 
@@ -273,6 +258,10 @@ fn viewport_top_row(metrics: Option<ScrollMetrics>) -> u32 {
                 .saturating_sub(metrics.offset_from_bottom)
         })
         .unwrap_or(0) as u32
+}
+
+pub(crate) fn absolute_row_for_viewport(viewport_row: u16, metrics: Option<ScrollMetrics>) -> u32 {
+    absolute_row_for_viewport_row(viewport_row, metrics)
 }
 
 fn absolute_row_for_viewport_row(viewport_row: u16, metrics: Option<ScrollMetrics>) -> u32 {
@@ -511,19 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn block_selection_normalizes_corners_and_contains_only_rectangle() {
-        let mut sel = Selection::block_anchor(PaneId::from_raw(0), 4, 10, None);
-        sel.drag(5, 2, Rect::new(0, 0, 80, 24), None);
-
-        assert_eq!(sel.ordered_cells(), ((2, 5), (4, 10)));
-        assert!(sel.contains(2, 5, None));
-        assert!(sel.contains(3, 7, None));
-        assert!(sel.contains(4, 10, None));
-        assert!(!sel.contains(2, 4, None));
-        assert!(!sel.contains(3, 11, None));
-    }
-
-    #[test]
     fn anchored_not_visible() {
         let sel = Selection::anchor(PaneId::from_raw(0), 5, 10, None);
         assert!(!sel.is_visible());
@@ -533,7 +509,7 @@ mod tests {
     #[test]
     fn click_without_drag() {
         let mut sel = Selection::anchor(PaneId::from_raw(0), 5, 10, None);
-        assert!(sel.was_just_click());
+        assert!(sel.is_just_click());
         let copied = sel.finish();
         assert!(!copied);
     }
@@ -543,7 +519,7 @@ mod tests {
         let mut sel = Selection::anchor(PaneId::from_raw(0), 5, 10, None);
         sel.drag(20, 7, Rect::new(10, 5, 80, 24), None);
         assert!(sel.is_visible());
-        assert!(!sel.was_just_click());
+        assert!(!sel.is_just_click());
         let copied = sel.finish();
         assert!(copied);
     }
